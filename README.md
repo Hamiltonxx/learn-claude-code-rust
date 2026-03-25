@@ -1,4 +1,8 @@
 [English](./README.md) | [中文](./README-zh.md) | [日本語](./README-ja.md)
+
+> **Rust implementation** of [learn-claude-code](https://github.com/shareAI-lab/learn-claude-code) by [@shareAI-lab](https://github.com/shareAI-lab).
+> Original Python version teaches harness engineering; this repo re-implements every session in Rust.
+
 # Learn Claude Code -- Harness Engineering for Real Agents
 
 ## The Model IS the Agent
@@ -189,29 +193,36 @@ First we fill the workshops. Then the farms, the hospitals, the factories. Then 
 
 ## The Core Pattern
 
-```python
-def agent_loop(messages):
-    while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM,
-            messages=messages, tools=TOOLS,
-        )
-        messages.append({"role": "assistant",
-                         "content": response.content})
+```rust
+async fn agent_loop(messages: &mut Vec<Message>, client: &Client, api_key: &str) {
+    loop {
+        let response = call_api(client, api_key, messages).await;
+        messages.push(Message {
+            role: "assistant".to_string(),
+            content: json!(response.content),
+        });
 
-        if response.stop_reason != "tool_use":
-            return
+        if response.stop_reason.as_deref() != Some("tool_use") {
+            return;
+        }
 
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                output = TOOL_HANDLERS[block.name](**block.input)
-                results.append({
+        let mut results = vec![];
+        for block in &response.content {
+            if let ContentBlock::ToolUse { id, name, input } = block {
+                let output = TOOL_HANDLERS[name](input).await;
+                results.push(json!({
                     "type": "tool_result",
-                    "tool_use_id": block.id,
+                    "tool_use_id": id,
                     "content": output,
-                })
-        messages.append({"role": "user", "content": results})
+                }))
+            }
+        }
+        messages.push(Message {
+            role: "user".to_string(),
+            content: json!(results),
+        });    
+    }
+}
 ```
 
 Every session layers one harness mechanism on top of this loop -- without changing the loop itself. The loop belongs to the agent. The mechanisms belong to the harness.
@@ -232,14 +243,12 @@ Treat the team JSONL mailbox protocol in this repo as a teaching implementation,
 ## Quick Start
 
 ```sh
-git clone https://github.com/shareAI-lab/learn-claude-code
-cd learn-claude-code
-pip install -r requirements.txt
-cp .env.example .env   # Edit .env with your ANTHROPIC_API_KEY
+git clone https://github.com/Hamiltonxx/learn-claude-code-rust
+cd learn-claude-code-rust
+export ANTHROPIC_API_KEY=your_key
 
-python agents/s01_agent_loop.py       # Start here
-python agents/s12_worktree_task_isolation.py  # Full progression endpoint
-python agents/s_full.py               # Capstone: all mechanisms combined
+cargo run --bin s01_agent_loop        # Start here
+cargo run --bin s12_worktree_task_isolation    # Full progression endpoint
 ```
 
 ### Web Platform
@@ -287,13 +296,18 @@ s08  Background Tasks        [6]     s10  Team Protocols          [12]
 ## Architecture
 
 ```
-learn-claude-code/
-|
-|-- agents/                        # Python reference implementations (s01-s12 + s_full capstone)
-|-- docs/{en,zh,ja}/               # Mental-model-first documentation (3 languages)
-|-- web/                           # Interactive learning platform (Next.js)
-|-- skills/                        # Skill files for s05
-+-- .github/workflows/ci.yml      # CI: typecheck + build
+  learn-claude-code-rust/
+  |
+  |-- src/
+  |   |-- lib.rs                     # Shared types: Message, ApiRequest, ApiResponse, ContentBlock
+  |   +-- bin/
+  |       |-- s01_agent_loop.rs      # ✅ done
+  |       |-- s02_tool_use.rs        # 🚧
+  |       ... (s03-s12)
+  |-- docs/{en,zh,ja}/               # Mental-model-first documentation
+  |-- web/                           # Interactive learning platform (Next.js)
+  |-- skills/                        # Skill files for s05
+
 ```
 
 ## Documentation
@@ -316,49 +330,7 @@ Available in [English](./docs/en/) | [中文](./docs/zh/) | [日本語](./docs/j
 | [s11](./docs/en/s11-autonomous-agents.md) | Autonomous Agents | *Teammates scan the board and claim tasks themselves* |
 | [s12](./docs/en/s12-worktree-task-isolation.md) | Worktree + Task Isolation | *Each works in its own directory, no interference* |
 
-## What's Next -- from understanding to shipping
-
-After the 12 sessions you understand how harness engineering works inside out. Two ways to put that knowledge to work:
-
-### Kode Agent CLI -- Open-Source Coding Agent CLI
-
-> `npm i -g @shareai-lab/kode`
-
-Skill & LSP support, Windows-ready, pluggable with GLM / MiniMax / DeepSeek and other open models. Install and go.
-
-GitHub: **[shareAI-lab/Kode-cli](https://github.com/shareAI-lab/Kode-cli)**
-
-### Kode Agent SDK -- Embed Agent Capabilities in Your App
-
-The official Claude Code Agent SDK communicates with a full CLI process under the hood -- each concurrent user means a separate terminal process. Kode SDK is a standalone library with no per-user process overhead, embeddable in backends, browser extensions, embedded devices, or any runtime.
-
-GitHub: **[shareAI-lab/Kode-agent-sdk](https://github.com/shareAI-lab/Kode-agent-sdk)**
-
 ---
-
-## Sister Repo: from *on-demand sessions* to *always-on assistant*
-
-The harness this repo teaches is **use-and-discard** -- open a terminal, give the agent a task, close when done, next session starts blank. That is the Claude Code model.
-
-[OpenClaw](https://github.com/openclaw/openclaw) proved another possibility: on top of the same agent core, two harness mechanisms turn the agent from "poke it to make it move" into "it wakes up every 30 seconds to look for work":
-
-- **Heartbeat** -- every 30s the harness sends the agent a message to check if there is anything to do. Nothing? Go back to sleep. Something? Act immediately.
-- **Cron** -- the agent can schedule its own future tasks, executed automatically when the time comes.
-
-Add multi-channel IM routing (WhatsApp / Telegram / Slack / Discord, 13+ platforms), persistent context memory, and a Soul personality system, and the agent goes from a disposable tool to an always-on personal AI assistant.
-
-**[claw0](https://github.com/shareAI-lab/claw0)** is our companion teaching repo that deconstructs these harness mechanisms from scratch:
-
-```
-claw agent = agent core + heartbeat + cron + IM chat + memory + soul
-```
-
-```
-learn-claude-code                   claw0
-(agent harness core:                (proactive always-on harness:
- loop, tools, planning,              heartbeat, cron, IM channels,
- teams, worktree isolation)          memory, soul personality)
-```
 
 ## About
 <img width="260" src="https://github.com/user-attachments/assets/fe8b852b-97da-4061-a467-9694906b5edf" /><br>
