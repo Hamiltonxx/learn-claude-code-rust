@@ -43,3 +43,12 @@ pub enum ContentBlock {
         content: String,
     },
 }
+
+use async_trait::async_trait;
+
+#[async_trait]
+pub trait Tool: Send + Sync {
+    fn name(&self) -> &str;
+    fn definition(&self) -> Value; // 告诉 Claude 这个工具叫什么、参数是什么
+    async fn execute(&self, input: Value) -> String;
+}
