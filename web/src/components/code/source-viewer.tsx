@@ -9,37 +9,31 @@ interface SourceViewerProps {
 
 function highlightLine(line: string): React.ReactNode[] {
   const trimmed = line.trimStart();
-  if (trimmed.startsWith("#")) {
+  if (trimmed.startsWith("//")) {
     return [
       <span key={0} className="text-zinc-400 italic">
         {line}
       </span>,
     ];
   }
-  if (trimmed.startsWith("@")) {
+  if (trimmed.startsWith("#[") || trimmed.startsWith("#!")) {
     return [
       <span key={0} className="text-amber-400">
         {line}
       </span>,
     ];
   }
-  if (trimmed.startsWith('"""') || trimmed.startsWith("'''")) {
-    return [
-      <span key={0} className="text-emerald-500">
-        {line}
-      </span>,
-    ];
-  }
 
   const keywordSet = new Set([
-    "def", "class", "import", "from", "return", "if", "elif", "else",
-    "while", "for", "in", "not", "and", "or", "is", "None", "True",
-    "False", "try", "except", "raise", "with", "as", "yield", "break",
-    "continue", "pass", "global", "lambda", "async", "await",
+    "fn", "let", "mut", "pub", "use", "struct", "impl", "trait", "enum",
+    "return", "if", "else", "while", "for", "in", "match", "loop",
+    "async", "await", "true", "false", "const", "mod", "self", "Self",
+    "type", "where", "break", "continue", "move", "ref", "super", "crate",
+    "Box", "Vec", "String", "Option", "Result", "Some", "None", "Ok", "Err",
   ]);
 
   const parts = line.split(
-    /(\b(?:def|class|import|from|return|if|elif|else|while|for|in|not|and|or|is|None|True|False|try|except|raise|with|as|yield|break|continue|pass|global|lambda|async|await|self)\b|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|f"(?:[^"\\]|\\.)*"|f'(?:[^'\\]|\\.)*'|#.*$|\b\d+(?:\.\d+)?\b)/
+    /(\b(?:fn|let|mut|pub|use|struct|impl|trait|enum|return|if|else|while|for|in|match|loop|async|await|true|false|const|mod|self|Self|type|where|break|continue|move|ref|super|crate|Box|Vec|String|Option|Result|Some|None|Ok|Err)\b|"(?:[^"\\]|\\.)*"|\/\/.*$|\b\d+(?:\.\d+)?\b)/
   );
 
   return parts.map((part, idx) => {
@@ -47,18 +41,13 @@ function highlightLine(line: string): React.ReactNode[] {
     if (keywordSet.has(part)) {
       return <span key={idx} className="text-blue-400 font-medium">{part}</span>;
     }
-    if (part === "self") {
+    if (part === "self" || part === "Self") {
       return <span key={idx} className="text-purple-400">{part}</span>;
     }
-    if (part.startsWith("#")) {
+    if (part.startsWith("//")) {
       return <span key={idx} className="text-zinc-400 italic">{part}</span>;
     }
-    if (
-      (part.startsWith('"') && part.endsWith('"')) ||
-      (part.startsWith("'") && part.endsWith("'")) ||
-      (part.startsWith('f"') && part.endsWith('"')) ||
-      (part.startsWith("f'") && part.endsWith("'"))
-    ) {
+    if (part.startsWith('"') && part.endsWith('"')) {
       return <span key={idx} className="text-emerald-500">{part}</span>;
     }
     if (/^\d+(?:\.\d+)?$/.test(part)) {

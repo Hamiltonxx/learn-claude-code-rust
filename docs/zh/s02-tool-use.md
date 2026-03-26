@@ -15,87 +15,92 @@
 ## 解决方案
 
 ```
-+--------+      +-------+      +------------------+
-|  User  | ---> |  LLM  | ---> | Tool Dispatch    |
-| prompt |      |       |      | {                |
-+--------+      +---+---+      |   bash: run_bash |
-                    ^           |   read: run_read |
-                    |           |   write: run_wr  |
-                    +-----------+   edit: run_edit |
-                    tool_result | }                |
-                                +------------------+
++--------+      +-------+      +----------------------+
+|  User  | ---> |  LLM  | ---> | Tool Dispatch        |
+| prompt |      |       |      | HashMap {            |
++--------+      +---+---+      |   "bash": BashTool   |
+                    ^           |   "read": ReadTool   |
+                    |           |   "write": WriteTool |
+                    +-----------+   "edit": EditTool   |
+                    tool_result | }                    |
+                                +----------------------+
 
-The dispatch map is a dict: {tool_name: handler_function}.
-One lookup replaces any if/elif chain.
+dispatch map 是 HashMap<String, Box<dyn Tool>>。
+一次查找替代所有 if/else 分支。
 ```
 
 ## 工作原理
 
-1. 每个工具有一个处理函数。路径沙箱防止逃逸工作区。
+1. 定义 `Tool` trait，每个工具实现它。
 
-```python
-def safe_path(p: str) -> Path:
-    path = (WORKDIR / p).resolve()
-    if not path.is_relative_to(WORKDIR):
-        raise ValueError(f"Path escapes workspace: {p}")
-    return path
+```rust
+#[async_trait]
+pub trait Tool: Send + Sync {
+    fn name(&self) -> &str;
+    fn definition(&self) -> Value;
+    async fn execute(&self, input: Value) -> String;
+}
 
-def run_read(path: str, limit: int = None) -> str:
-    text = safe_path(path).read_text()
-    lines = text.splitlines()
-    if limit and limit < len(lines):
-        lines = lines[:limit]
-    return "\n".join(lines)[:50000]
-```
+struct ReadFileTool;
 
-2. dispatch map 将工具名映射到处理函数。
+#[async_trait]
+impl Tool for ReadFileTool {
+    fn name(&self) -> &str { "read_file" }
 
-```python
-TOOL_HANDLERS = {
-    "bash":       lambda **kw: run_bash(kw["command"]),
-    "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
-    "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
-    "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"],
-                                        kw["new_text"]),
+    async fn execute(&self, input: Value) -> String {
+        let path = input["path"].as_str().unwrap_or("");
+        std::fs::read_to_string(path).unwrap_or_else(|e| e.to_string())
+    }
+    // ...
 }
 ```
 
-3. 循环中按名称查找处理函数。循环体本身与 s01 完全一致。
+2. dispatch map 将工具名映射到处理对象。
 
-```python
-for block in response.content:
-    if block.type == "tool_use":
-        handler = TOOL_HANDLERS.get(block.name)
-        output = handler(**block.input) if handler \
-            else f"Unknown tool: {block.name}"
-        results.append({
-            "type": "tool_result",
-            "tool_use_id": block.id,
-            "content": output,
-        })
+```rust
+let mut tools: HashMap<String, Box<dyn Tool>> = HashMap::new();
+tools.insert("bash".to_string(),       Box::new(BashTool));
+tools.insert("read_file".to_string(),  Box::new(ReadFileTool));
+tools.insert("write_file".to_string(), Box::new(WriteFileTool));
+tools.insert("edit_file".to_string(),  Box::new(EditFileTool));
 ```
 
-加工具 = 加 handler + 加 schema。循环永远不变。
+3. 循环中按名称查找处理对象。循环体本身与 s01 完全一致。
+
+```rust
+for block in &response.content {
+    if let ContentBlock::ToolUse { id, name, input } = block {
+        let result = tools[name].execute(input.clone()).await;
+        tool_results.push(json!({
+            "type": "tool_result",
+            "tool_use_id": id,
+            "content": result,
+        }));
+    }
+}
+```
+
+加工具 = 实现 `Tool` trait + 插入 `HashMap`。循环永远不变。
 
 ## 相对 s01 的变更
 
-| 组件           | 之前 (s01)         | 之后 (s02)                     |
-|----------------|--------------------|--------------------------------|
-| Tools          | 1 (仅 bash)        | 4 (bash, read, write, edit)    |
-| Dispatch       | 硬编码 bash 调用   | `TOOL_HANDLERS` 字典           |
-| 路径安全       | 无                 | `safe_path()` 沙箱             |
-| Agent loop     | 不变               | 不变                           |
+| 组件           | 之前 (s01)          | 之后 (s02)                       |
+|----------------|---------------------|----------------------------------|
+| Tools          | 1 (仅 bash)         | 4 (bash, read, write, edit)      |
+| Dispatch       | 硬编码 bash 调用    | `HashMap<String, Box<dyn Tool>>` |
+| 抽象           | 无                  | `Tool` trait object              |
+| Agent loop     | 不变                | 不变                             |
 
 ## 试一试
 
 ```sh
-cd learn-claude-code
-python agents/s02_tool_use.py
+cd learn-claude-code-rust
+cargo run --bin s02_tool_use
 ```
 
-试试这些 prompt (英文 prompt 对 LLM 效果更好, 也可以用中文):
+试试这些 prompt:
 
-1. `Read the file requirements.txt`
-2. `Create a file called greet.py with a greet(name) function`
-3. `Edit greet.py to add a docstring to the function`
-4. `Read greet.py to verify the edit worked`
+1. `Read the file Cargo.toml and summarize it`
+2. `Create a file called greet.rs with a greet function`
+3. `Edit greet.rs to add a comment to the function`
+4. `Read greet.rs to verify the edit worked`

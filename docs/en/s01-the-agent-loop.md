@@ -29,88 +29,104 @@ One exit condition controls the entire flow. The loop runs until the model stops
 
 1. User prompt becomes the first message.
 
-```python
-messages.append({"role": "user", "content": query})
+```rust
+messages.push(Message {
+    role: "user".to_string(),
+    content: json!(input.trim()),
+});
 ```
 
 2. Send messages + tool definitions to the LLM.
 
-```python
-response = client.messages.create(
-    model=MODEL, system=SYSTEM, messages=messages,
-    tools=TOOLS, max_tokens=8000,
-)
+```rust
+let response = call_api(&client, &api_key, &messages).await;
 ```
 
 3. Append the assistant response. Check `stop_reason` -- if the model didn't call a tool, we're done.
 
-```python
-messages.append({"role": "assistant", "content": response.content})
-if response.stop_reason != "tool_use":
-    return
+```rust
+messages.push(Message {
+    role: "assistant".to_string(),
+    content: json!(reply),
+});
+if response.stop_reason.as_deref() != Some("tool_use") {
+    break;
+}
 ```
 
 4. Execute each tool call, collect results, append as a user message. Loop back to step 2.
 
-```python
-results = []
-for block in response.content:
-    if block.type == "tool_use":
-        output = run_bash(block.input["command"])
-        results.append({
+```rust
+for block in &response.content {
+    if let ContentBlock::ToolUse { id, name, input } = block {
+        let result = execute_tool(name, input).await;
+        tool_results.push(json!({
             "type": "tool_result",
-            "tool_use_id": block.id,
-            "content": output,
-        })
-messages.append({"role": "user", "content": results})
+            "tool_use_id": id,
+            "content": result,
+        }));
+    }
+}
+messages.push(Message {
+    role: "user".to_string(),
+    content: json!(tool_results),
+});
 ```
 
 Assembled into one function:
 
-```python
-def agent_loop(query):
-    messages = [{"role": "user", "content": query}]
-    while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
-        )
-        messages.append({"role": "assistant", "content": response.content})
+```rust
+async fn agent_loop(client: &Client, api_key: &str) {
+    let mut messages: Vec<Message> = vec![];
+    loop {
+        let response = call_api(client, api_key, &messages).await;
+        messages.push(Message {
+            role: "assistant".to_string(),
+            content: json!(response.content),
+        });
 
-        if response.stop_reason != "tool_use":
-            return
+        if response.stop_reason.as_deref() != Some("tool_use") {
+            break;
+        }
 
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                output = run_bash(block.input["command"])
-                results.append({
+        let mut tool_results = vec![];
+        for block in &response.content {
+            if let ContentBlock::ToolUse { id, name, input } = block {
+                let result = execute_tool(name, input).await;
+                tool_results.push(json!({
                     "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": output,
-                })
-        messages.append({"role": "user", "content": results})
+                    "tool_use_id": id,
+                    "content": result,
+                }));
+            }
+        }
+        messages.push(Message {
+            role: "user".to_string(),
+            content: json!(tool_results),
+        });
+    }
+}
 ```
 
 That's the entire agent in under 30 lines. Everything else in this course layers on top -- without changing the loop.
 
 ## What Changed
 
-| Component     | Before     | After                          |
-|---------------|------------|--------------------------------|
-| Agent loop    | (none)     | `while True` + stop_reason     |
-| Tools         | (none)     | `bash` (one tool)              |
-| Messages      | (none)     | Accumulating list              |
-| Control flow  | (none)     | `stop_reason != "tool_use"`    |
+| Component     | Before     | After                              |
+|---------------|------------|------------------------------------|
+| Agent loop    | (none)     | `loop` + stop_reason check         |
+| Tools         | (none)     | `bash` (one tool)                  |
+| Messages      | (none)     | Accumulating `Vec<Message>`        |
+| Control flow  | (none)     | `stop_reason != "tool_use"`        |
 
 ## Try It
 
 ```sh
-cd learn-claude-code
-python agents/s01_agent_loop.py
+cd learn-claude-code-rust
+cargo run --bin s01_agent_loop
 ```
 
-1. `Create a file called hello.py that prints "Hello, World!"`
-2. `List all Python files in this directory`
+1. `Create a file called hello.rs that prints "Hello, World!"`
+2. `List all Rust files in this directory`
 3. `What is the current git branch?`
 4. `Create a directory called test_output and write 3 files in it`

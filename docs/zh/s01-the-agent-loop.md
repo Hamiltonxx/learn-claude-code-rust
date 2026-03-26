@@ -29,90 +29,106 @@
 
 1. 用户 prompt 作为第一条消息。
 
-```python
-messages.append({"role": "user", "content": query})
+```rust
+messages.push(Message {
+    role: "user".to_string(),
+    content: json!(input.trim()),
+});
 ```
 
 2. 将消息和工具定义一起发给 LLM。
 
-```python
-response = client.messages.create(
-    model=MODEL, system=SYSTEM, messages=messages,
-    tools=TOOLS, max_tokens=8000,
-)
+```rust
+let response = call_api(&client, &api_key, &messages).await;
 ```
 
 3. 追加助手响应。检查 `stop_reason` -- 如果模型没有调用工具, 结束。
 
-```python
-messages.append({"role": "assistant", "content": response.content})
-if response.stop_reason != "tool_use":
-    return
+```rust
+messages.push(Message {
+    role: "assistant".to_string(),
+    content: json!(reply),
+});
+if response.stop_reason.as_deref() != Some("tool_use") {
+    break;
+}
 ```
 
 4. 执行每个工具调用, 收集结果, 作为 user 消息追加。回到第 2 步。
 
-```python
-results = []
-for block in response.content:
-    if block.type == "tool_use":
-        output = run_bash(block.input["command"])
-        results.append({
+```rust
+for block in &response.content {
+    if let ContentBlock::ToolUse { id, name, input } = block {
+        let result = execute_tool(name, input).await;
+        tool_results.push(json!({
             "type": "tool_result",
-            "tool_use_id": block.id,
-            "content": output,
-        })
-messages.append({"role": "user", "content": results})
+            "tool_use_id": id,
+            "content": result,
+        }));
+    }
+}
+messages.push(Message {
+    role: "user".to_string(),
+    content: json!(tool_results),
+});
 ```
 
 组装为一个完整函数:
 
-```python
-def agent_loop(query):
-    messages = [{"role": "user", "content": query}]
-    while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
-        )
-        messages.append({"role": "assistant", "content": response.content})
+```rust
+async fn agent_loop(client: &Client, api_key: &str) {
+    let mut messages: Vec<Message> = vec![];
+    loop {
+        let response = call_api(client, api_key, &messages).await;
+        messages.push(Message {
+            role: "assistant".to_string(),
+            content: json!(response.content),
+        });
 
-        if response.stop_reason != "tool_use":
-            return
+        if response.stop_reason.as_deref() != Some("tool_use") {
+            break;
+        }
 
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                output = run_bash(block.input["command"])
-                results.append({
+        let mut tool_results = vec![];
+        for block in &response.content {
+            if let ContentBlock::ToolUse { id, name, input } = block {
+                let result = execute_tool(name, input).await;
+                tool_results.push(json!({
                     "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": output,
-                })
-        messages.append({"role": "user", "content": results})
+                    "tool_use_id": id,
+                    "content": result,
+                }));
+            }
+        }
+        messages.push(Message {
+            role: "user".to_string(),
+            content: json!(tool_results),
+        });
+    }
+}
 ```
 
 不到 30 行, 这就是整个智能体。后面 11 个章节都在这个循环上叠加机制 -- 循环本身始终不变。
 
 ## 变更内容
 
-| 组件          | 之前       | 之后                           |
-|---------------|------------|--------------------------------|
-| Agent loop    | (无)       | `while True` + stop_reason     |
-| Tools         | (无)       | `bash` (单一工具)              |
-| Messages      | (无)       | 累积式消息列表                 |
-| Control flow  | (无)       | `stop_reason != "tool_use"`    |
+| 组件          | 之前       | 之后                               |
+|---------------|------------|------------------------------------|
+| Agent loop    | (无)       | `loop` + stop_reason 检查          |
+| Tools         | (无)       | `bash` (单一工具)                  |
+| Messages      | (无)       | 累积式 `Vec<Message>`              |
+| Control flow  | (无)       | `stop_reason != "tool_use"`        |
 
 ## 试一试
 
 ```sh
-cd learn-claude-code
-python agents/s01_agent_loop.py
+cd learn-claude-code-rust
+cargo run --bin s01_agent_loop
 ```
 
-试试这些 prompt (英文 prompt 对 LLM 效果更好, 也可以用中文):
+试试这些 prompt:
 
-1. `Create a file called hello.py that prints "Hello, World!"`
-2. `List all Python files in this directory`
+1. `Create a file called hello.rs that prints "Hello, World!"`
+2. `List all Rust files in this directory`
 3. `What is the current git branch?`
 4. `Create a directory called test_output and write 3 files in it`
