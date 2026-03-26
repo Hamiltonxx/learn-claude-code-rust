@@ -11,7 +11,7 @@ import { VERSION_META, VERSION_ORDER, LEARNING_PATH } from "../src/lib/constants
 // Resolve paths relative to this script's location (web/scripts/)
 const WEB_DIR = path.resolve(__dirname, "..");
 const REPO_ROOT = path.resolve(WEB_DIR, "..");
-const AGENTS_DIR = path.join(REPO_ROOT, "agents");
+const AGENTS_DIR = path.join(REPO_ROOT, "src", "bin");
 const DOCS_DIR = path.join(REPO_ROOT, "docs");
 const OUT_DIR = path.join(WEB_DIR, "src", "data", "generated");
 
@@ -20,7 +20,7 @@ const OUT_DIR = path.join(WEB_DIR, "src", "data", "generated");
 // s02_tools.py -> s02
 // s_full.py -> s_full (reference agent, typically skipped)
 function filenameToVersionId(filename: string): string | null {
-  const base = path.basename(filename, ".py");
+  const base = path.basename(filename, ".rs"); // .py -> .rs
   if (base === "s_full") return null;
   if (base === "__init__") return null;
 
@@ -34,20 +34,20 @@ function extractClasses(
   lines: string[]
 ): { name: string; startLine: number; endLine: number }[] {
   const classes: { name: string; startLine: number; endLine: number }[] = [];
-  const classPattern = /^class\s+(\w+)/;
+  const classPattern = /^(pub\s+)?struct\s+(\w+)/;
 
   for (let i = 0; i < lines.length; i++) {
     const m = lines[i].match(classPattern);
     if (m) {
-      const name = m[1];
+      const name = m[2]; // 改成 m[2] (因为有可选的 pub 捕获组)
       const startLine = i + 1;
       // Find end of class: next class/function at indent 0, or EOF
       let endLine = lines.length;
       for (let j = i + 1; j < lines.length; j++) {
         if (
-          lines[j].match(/^class\s/) ||
-          lines[j].match(/^def\s/) ||
-          (lines[j].match(/^\S/) && lines[j].trim() !== "" && !lines[j].startsWith("#") && !lines[j].startsWith("@"))
+          lines[j].match(/^(pub\s+)?struct\s/) ||
+          lines[j].match(/^(pub\s+)?fn\s/) ||
+          (lines[j].match(/^\S/) && lines[j].trim() !== "" && !lines[j].startsWith("//") && !lines[j].startsWith("@"))
         ) {
           endLine = j;
           break;
@@ -64,14 +64,14 @@ function extractFunctions(
   lines: string[]
 ): { name: string; signature: string; startLine: number }[] {
   const functions: { name: string; signature: string; startLine: number }[] = [];
-  const funcPattern = /^def\s+(\w+)\((.*?)\)/;
+  const funcPattern = /^(pub\s+)?(async\s+)?fn\s+(\w+)/;
 
   for (let i = 0; i < lines.length; i++) {
     const m = lines[i].match(funcPattern);
     if (m) {
       functions.push({
-        name: m[1],
-        signature: `def ${m[1]}(${m[2]})`,
+        name: m[3],
+        signature: lines[i].trim(),
         startLine: i + 1,
       });
     }
@@ -95,7 +95,7 @@ function extractTools(source: string): string[] {
 function countLoc(lines: string[]): number {
   return lines.filter((line) => {
     const trimmed = line.trim();
-    return trimmed !== "" && !trimmed.startsWith("#");
+    return trimmed !== "" && !trimmed.startsWith("//");
   }).length;
 }
 
@@ -133,7 +133,7 @@ function main() {
   // 1. Read all agent files
   const agentFiles = fs
     .readdirSync(AGENTS_DIR)
-    .filter((f) => f.startsWith("s") && f.endsWith(".py"));
+    .filter((f) => f.startsWith("s") && f.endsWith(".rs"));
 
   console.log(`  Found ${agentFiles.length} agent files`);
 
