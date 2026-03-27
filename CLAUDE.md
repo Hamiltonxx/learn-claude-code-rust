@@ -23,8 +23,8 @@
 |-----|------|------|
 | 1 | Rust 项目初始化 + S01 agent loop（上下文记忆） | ✅ |
 | 2 | ECS 部署，网站上线 https://learncc.cirray.cn | ✅ |
-| 3 | S02 Tool Dispatch（trait object + HashMap） | ⬜ |
-| 4 | S03 TodoWrite + S04 Subagent | ⬜ |
+| 3 | S02 Tool Dispatch（trait object + HashMap） | ✅ |
+| 4 | S03 TodoWrite + S04 Subagent | ✅ |
 | 5 | S05 Skill Loading + S06 Context Compact | ⬜ |
 | 6-7 | 缓冲 + 注释 + 文档 | ⬜ |
 | 8 | S07 Task System | ⬜ |
