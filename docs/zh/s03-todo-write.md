@@ -36,44 +36,69 @@
 
 1. TodoManager 存储带状态的项目。同一时间只允许一个 `in_progress`。
 
-```python
-class TodoManager:
-    def update(self, items: list) -> str:
-        validated, in_progress_count = [], 0
-        for item in items:
-            status = item.get("status", "pending")
-            if status == "in_progress":
-                in_progress_count += 1
-            validated.append({"id": item["id"], "text": item["text"],
-                              "status": status})
-        if in_progress_count > 1:
-            raise ValueError("Only one task can be in_progress")
-        self.items = validated
-        return self.render()
-```
+```rust
+#[derive(Debug, Clone)]
+struct TodoItem {
+    id: u32,
+    title: String,
+    status: String,  // "pending" | "in_progress" | "done"
+}
 
-2. `todo` 工具和其他工具一样加入 dispatch map。
+struct TodoManager {
+    todos: Vec<TodoItem>,
+    next_id: u32,
+}
 
-```python
-TOOL_HANDLERS = {
-    # ...base tools...
-    "todo": lambda **kw: TODO.update(kw["items"]),
+impl TodoManager {
+    fn update(&mut self, id: u32, status: &str) -> String {
+        match self.todos.iter_mut().find(|t| t.id == id) {
+            Some(todo) => { todo.status = status.to_string(); format!("任务 #{} -> {}", id, status) }
+            None => format!("找不到任务 #{}", id),
+        }
+    }
 }
 ```
 
-3. nag reminder: 模型连续 3 轮以上不调用 `todo` 时注入提醒。
+2. `TodoWriteTool` 实现 `Tool` trait，持有 `Arc<Mutex<TodoManager>>`，和其他工具一样注册进 dispatch map。
 
-```python
-if rounds_since_todo >= 3 and messages:
-    last = messages[-1]
-    if last["role"] == "user" and isinstance(last.get("content"), list):
-        last["content"].insert(0, {
-            "type": "text",
-            "text": "<reminder>Update your todos.</reminder>",
-        })
+```rust
+struct TodoWriteTool {
+    manager: Arc<Mutex<TodoManager>>,
+}
+
+#[async_trait]
+impl Tool for TodoWriteTool {
+    fn name(&self) -> &str { "todo_write" }
+    async fn execute(&self, input: Value) -> String {
+        let mut mgr = self.manager.lock().unwrap();
+        match input["action"].as_str().unwrap_or("") {
+            "add"    => { let t = input["title"].as_str().unwrap_or("未命名");
+                          format!("已添加 #{}: {}", mgr.add(t), t) }
+            "list"   => mgr.list(),
+            "update" => mgr.update(input["id"].as_u64().unwrap_or(0) as u32,
+                                   input["status"].as_str().unwrap_or("pending")),
+            "delete" => mgr.delete(input["id"].as_u64().unwrap_or(0) as u32),
+            other    => format!("未知操作: {}", other),
+        }
+    }
+}
+
+// 注册进 dispatch map
+tools.insert("todo_write".to_string(), Box::new(TodoWriteTool { manager }));
 ```
 
-"同时只能有一个 in_progress" 强制顺序聚焦。nag reminder 制造问责压力 -- 你不更新计划, 系统就追着你问。
+3. 规划规则写进 system prompt，强制模型先列任务再执行。
+
+```rust
+let system = "你是一个有条理的助手。执行任何多步骤任务时必须：
+    1. 先用 todo_write(add) 把所有子任务列出
+    2. 开始某步前用 todo_write(update, in_progress) 标记
+    3. 完成后用 todo_write(update, done) 标记
+    不允许跳过规划直接执行。
+";
+```
+
+`Arc<Mutex<TodoManager>>` 让 tool trait object 安全持有可变状态；system prompt 的约束替代了 nag reminder 机制。
 
 ## 相对 s02 的变更
 
@@ -81,18 +106,17 @@ if rounds_since_todo >= 3 and messages:
 |----------------|------------------|--------------------------------|
 | Tools          | 4                | 5 (+todo)                      |
 | 规划           | 无               | 带状态的 TodoManager           |
-| Nag 注入       | 无               | 3 轮后注入 `<reminder>`        |
-| Agent loop     | 简单分发         | + rounds_since_todo 计数器     |
+| 规划约束       | 无               | system prompt 强制先列任务     |
+| 状态共享       | 全局变量         | `Arc<Mutex<TodoManager>>`      |
 
 ## 试一试
 
 ```sh
-cd learn-claude-code
-python agents/s03_todo_write.py
+cargo run --bin s03_todo
 ```
 
-试试这些 prompt (英文 prompt 对 LLM 效果更好, 也可以用中文):
+试试这些 prompt:
 
-1. `Refactor the file hello.py: add type hints, docstrings, and a main guard`
-2. `Create a Python package with __init__.py, utils.py, and tests/test_utils.py`
-3. `Review all Python files and fix any style issues`
+1. `帮我创建一个 hello world Rust 项目并运行`
+2. `创建三个文件：config.rs、utils.rs、main.rs，并在 main.rs 中引用它们`
+3. `读取 Cargo.toml，总结依赖，然后写一份 deps.md`
