@@ -34,46 +34,71 @@ On multi-step tasks, the model loses track. It repeats work, skips steps, or wan
 
 ## How It Works
 
-1. TodoManager stores items with statuses. Only one item can be `in_progress` at a time.
+1. `TodoManager` stores items with statuses, shared across async boundaries via `Arc<Mutex<T>>`.
 
-```python
-class TodoManager:
-    def update(self, items: list) -> str:
-        validated, in_progress_count = [], 0
-        for item in items:
-            status = item.get("status", "pending")
-            if status == "in_progress":
-                in_progress_count += 1
-            validated.append({"id": item["id"], "text": item["text"],
-                              "status": status})
-        if in_progress_count > 1:
-            raise ValueError("Only one task can be in_progress")
-        self.items = validated
-        return self.render()
-```
+```rust
+#[derive(Debug, Clone)]
+struct TodoItem {
+    id: u32,
+    title: String,
+    status: String,  // "pending" | "in_progress" | "done"
+}
 
-2. The `todo` tool goes into the dispatch map like any other tool.
+struct TodoManager {
+    todos: Vec<TodoItem>,
+    next_id: u32,
+}
 
-```python
-TOOL_HANDLERS = {
-    # ...base tools...
-    "todo": lambda **kw: TODO.update(kw["items"]),
+impl TodoManager {
+    fn update(&mut self, id: u32, status: &str) -> String {
+        match self.todos.iter_mut().find(|t| t.id == id) {
+            Some(todo) => { todo.status = status.to_string(); format!("Task #{} -> {}", id, status) }
+            None => format!("Task #{} not found", id),
+        }
+    }
 }
 ```
 
-3. A nag reminder injects a nudge if the model goes 3+ rounds without calling `todo`.
+2. `TodoWriteTool` implements the `Tool` trait and registers into the dispatch map like any other tool.
 
-```python
-if rounds_since_todo >= 3 and messages:
-    last = messages[-1]
-    if last["role"] == "user" and isinstance(last.get("content"), list):
-        last["content"].insert(0, {
-            "type": "text",
-            "text": "<reminder>Update your todos.</reminder>",
-        })
+```rust
+struct TodoWriteTool {
+    manager: Arc<Mutex<TodoManager>>,
+}
+
+#[async_trait]
+impl Tool for TodoWriteTool {
+    fn name(&self) -> &str { "todo_write" }
+    async fn execute(&self, input: Value) -> String {
+        let mut mgr = self.manager.lock().unwrap();
+        match input["action"].as_str().unwrap_or("") {
+            "add"    => { let t = input["title"].as_str().unwrap_or("untitled");
+                          format!("Added #{}: {}", mgr.add(t), t) }
+            "list"   => mgr.list(),
+            "update" => mgr.update(input["id"].as_u64().unwrap_or(0) as u32,
+                                   input["status"].as_str().unwrap_or("pending")),
+            "delete" => mgr.delete(input["id"].as_u64().unwrap_or(0) as u32),
+            other    => format!("Unknown action: {}", other),
+        }
+    }
+}
+
+// Register into dispatch map
+tools.insert("todo_write".to_string(), Box::new(TodoWriteTool { manager }));
 ```
 
-The "one in_progress at a time" constraint forces sequential focus. The nag reminder creates accountability.
+3. Planning rules are enforced via the system prompt, requiring the model to list tasks before executing.
+
+```rust
+let system = "You are an organized assistant. For any multi-step task you must:
+    1. First use todo_write(add) to list all subtasks
+    2. Before starting each step, use todo_write(update, in_progress)
+    3. After completing, use todo_write(update, done)
+    Do not skip planning and jump straight to execution.
+";
+```
+
+`Arc<Mutex<TodoManager>>` lets the tool trait object safely hold mutable state across async calls.
 
 ## What Changed From s02
 
@@ -81,16 +106,15 @@ The "one in_progress at a time" constraint forces sequential focus. The nag remi
 |----------------|------------------|----------------------------|
 | Tools          | 4                | 5 (+todo)                  |
 | Planning       | None             | TodoManager with statuses  |
-| Nag injection  | None             | `<reminder>` after 3 rounds|
-| Agent loop     | Simple dispatch  | + rounds_since_todo counter|
+| Planning rules | None             | system prompt enforcement  |
+| State sharing  | Global variable  | `Arc<Mutex<TodoManager>>`  |
 
 ## Try It
 
 ```sh
-cd learn-claude-code
-python agents/s03_todo_write.py
+cargo run --bin s03_todo
 ```
 
-1. `Refactor the file hello.py: add type hints, docstrings, and a main guard`
-2. `Create a Python package with __init__.py, utils.py, and tests/test_utils.py`
-3. `Review all Python files and fix any style issues`
+1. `Create a hello world Rust project and run it`
+2. `Create three files: config.rs, utils.rs, main.rs, and have main.rs reference them`
+3. `Read Cargo.toml, summarize the dependencies, then write a deps.md`
