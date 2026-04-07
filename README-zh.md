@@ -190,29 +190,24 @@ Claude Code = 一个 agent loop
 
 ## 核心模式
 
-```python
-def agent_loop(messages):
-    while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM,
-            messages=messages, tools=TOOLS,
-        )
-        messages.append({"role": "assistant",
-                         "content": response.content})
+```rust
+loop {
+    let response = call_api(&client, &api_key, &messages, &tool_defs, system).await;
+    messages.push(Message { role: "assistant".into(), content: json!(response.content) });
 
-        if response.stop_reason != "tool_use":
-            return
+    if response.stop_reason.as_deref() != Some("tool_use") {
+        break;
+    }
 
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                output = TOOL_HANDLERS[block.name](**block.input)
-                results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": output,
-                })
-        messages.append({"role": "user", "content": results})
+    let mut results = vec![];
+    for block in &response.content {
+        if let ContentBlock::ToolUse { id, name, input } = block {
+            let output = tools[name].execute(input.clone()).await;
+            results.push(json!({ "type": "tool_result", "tool_use_id": id, "content": output }));
+        }
+    }
+    messages.push(Message { role: "user".into(), content: json!(results) });
+}
 ```
 
 每个课程在这个循环之上叠加一个 harness 机制 -- 循环本身始终不变。循环属于 agent。机制属于 harness。
@@ -233,14 +228,13 @@ def agent_loop(messages):
 ## 快速开始
 
 ```sh
-git clone https://github.com/shareAI-lab/learn-claude-code
-cd learn-claude-code
-pip install -r requirements.txt
-cp .env.example .env   # 编辑 .env 填入你的 ANTHROPIC_API_KEY
+git clone https://github.com/Hamiltonxx/learn-claude-code-rust
+cd learn-claude-code-rust
+export ANTHROPIC_API_KEY=sk-xxx
 
-python agents/s01_agent_loop.py       # 从这里开始
-python agents/s12_worktree_task_isolation.py  # 完整递进终点
-python agents/s_full.py               # 总纲: 全部机制合一
+cargo run --bin s01_agent_loop        # 从这里开始
+cargo run --bin s12_worktree          # 完整递进终点
+cargo run --bin s_full                # 总纲: 全部机制合一
 ```
 
 ### Web 平台

@@ -190,29 +190,24 @@ Claude Code = 一つの agent loop
 
 ## コアパターン
 
-```python
-def agent_loop(messages):
-    while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM,
-            messages=messages, tools=TOOLS,
-        )
-        messages.append({"role": "assistant",
-                         "content": response.content})
+```rust
+loop {
+    let response = call_api(&client, &api_key, &messages, &tool_defs, system).await;
+    messages.push(Message { role: "assistant".into(), content: json!(response.content) });
 
-        if response.stop_reason != "tool_use":
-            return
+    if response.stop_reason.as_deref() != Some("tool_use") {
+        break;
+    }
 
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                output = TOOL_HANDLERS[block.name](**block.input)
-                results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": output,
-                })
-        messages.append({"role": "user", "content": results})
+    let mut results = vec![];
+    for block in &response.content {
+        if let ContentBlock::ToolUse { id, name, input } = block {
+            let output = tools[name].execute(input.clone()).await;
+            results.push(json!({ "type": "tool_result", "tool_use_id": id, "content": output }));
+        }
+    }
+    messages.push(Message { role: "user".into(), content: json!(results) });
+}
 ```
 
 各セッションはこのループの上に 1 つの Harness メカニズムを重ねる -- ループ自体は変わらない。ループは Agent のもの。メカニズムは Harness のもの。
@@ -233,14 +228,13 @@ def agent_loop(messages):
 ## クイックスタート
 
 ```sh
-git clone https://github.com/shareAI-lab/learn-claude-code
-cd learn-claude-code
-pip install -r requirements.txt
-cp .env.example .env   # .env を編集して ANTHROPIC_API_KEY を入力
+git clone https://github.com/Hamiltonxx/learn-claude-code-rust
+cd learn-claude-code-rust
+export ANTHROPIC_API_KEY=sk-xxx
 
-python agents/s01_agent_loop.py       # ここから開始
-python agents/s12_worktree_task_isolation.py  # 全セッションの到達点
-python agents/s_full.py               # 総括: 全メカニズム統合
+cargo run --bin s01_agent_loop        # ここから開始
+cargo run --bin s12_worktree          # 全セッションの到達点
+cargo run --bin s_full                # 総括: 全メカニズム統合
 ```
 
 ### Web プラットフォーム
