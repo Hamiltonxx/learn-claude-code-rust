@@ -311,6 +311,23 @@ learn-claude-code/
 | [s11](./docs/zh/s11-autonomous-agents.md) | 自治智能体 | *队友自己看看板, 有活就认领* |
 | [s12](./docs/zh/s12-worktree-task-isolation.md) | Worktree + 任务隔离 | *各干各的目录, 互不干扰* |
 
+## 每日构建日志（博客）
+
+比文档更口语化，适合刚接触 Rust 或 AI Agent 的读者——记录了每天遇到的真实问题和思考。
+
+| Day | 文章 |
+|-----|------|
+| 1-2 | [第一次对话 + 网站上线](https://blog.cirray.cn/posts/learn-agent-rust-day1-day2/) |
+| 3   | [让 Agent 真正能干活（工具分发）](https://blog.cirray.cn/posts/learn-agent-rust-day3/) |
+| 4   | [让 Agent 先想后做，还能分身](https://blog.cirray.cn/posts/rust-agent-todo-subagent-2026-03-27/) |
+| 5   | [知识按需注入，上下文永不爆炸](https://blog.cirray.cn/posts/rust-agent-skill-compact-2026-03-29/) |
+| 8   | [给 AI 一个任务清单，它第一反应是用标题当 ID](https://blog.cirray.cn/posts/rust-agent-task-system-2026-03-31/) |
+| 9   | [让 agent 同时做两件事，我踩了哪些异步的坑](https://blog.cirray.cn/posts/rust-agent-background-tasks-2026-04-03/) |
+| 10  | [一个 Claude 不够用，那就用两个](https://blog.cirray.cn/posts/rust-agent-teams-2026-04-04/) |
+| 11  | [不再等指令的 agent](https://blog.cirray.cn/posts/rust-agent-protocols-autonomous-2026-04-05/) |
+| 12  | [两个 Agent 把对方文件覆盖了，git worktree 三行解决](https://blog.cirray.cn/posts/rust-agent-worktree-day12-2026-04-06/) |
+| 13-14 | [代码全写完了，仓库还不是 Rust 项目](https://blog.cirray.cn/posts/rust-agent-day13-14-python-zero-2026-04-07/) |
+
 ## 学完之后 -- 从理解到落地
 
 12 个课程走完, 你已经从内到外理解了 harness 工程的运作原理。两种方式把知识变成产品:
