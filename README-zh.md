@@ -2,6 +2,8 @@
 
 [English](./README.md) | [中文](./README-zh.md) | [日本語](./README-ja.md)
 
+> **[learn-claude-code](https://github.com/shareAI-lab/learn-claude-code)（[@shareAI-lab](https://github.com/shareAI-lab)）的 Rust 重写版本。** 原项目用 Python 讲解 harness 工程；本仓库用 Rust 逐课重新实现。
+
 ## 模型就是 Agent
 
 在讨论代码之前，先把一件事彻底说清楚。
@@ -328,49 +330,6 @@ learn-claude-code/
 | 12  | [两个 Agent 把对方文件覆盖了，git worktree 三行解决](https://blog.cirray.cn/posts/rust-agent-worktree-day12-2026-04-06/) |
 | 13-14 | [代码全写完了，仓库还不是 Rust 项目](https://blog.cirray.cn/posts/rust-agent-day13-14-python-zero-2026-04-07/) |
 
-## 学完之后 -- 从理解到落地
-
-12 个课程走完, 你已经从内到外理解了 harness 工程的运作原理。两种方式把知识变成产品:
-
-### Kode Agent CLI -- 开源 Coding Agent CLI
-
-> `npm i -g @shareai-lab/kode`
-
-支持 Skill & LSP, 适配 Windows, 可接 GLM / MiniMax / DeepSeek 等开放模型。装完即用。
-
-GitHub: **[shareAI-lab/Kode-cli](https://github.com/shareAI-lab/Kode-cli)**
-
-### Kode Agent SDK -- 把 Agent 能力嵌入你的应用
-
-官方 Claude Code Agent SDK 底层与完整 CLI 进程通信 -- 每个并发用户 = 一个终端进程。Kode SDK 是独立库, 无 per-user 进程开销, 可嵌入后端、浏览器插件、嵌入式设备等任意运行时。
-
-GitHub: **[shareAI-lab/Kode-agent-sdk](https://github.com/shareAI-lab/Kode-agent-sdk)**
-
----
-
-## 姊妹教程: 从*被动临时会话*到*主动常驻助手*
-
-本仓库教的 harness 属于 **用完即走** 型 -- 开终端、给 agent 任务、做完关掉, 下次重开是全新会话。Claude Code 就是这种模式。
-
-但 [OpenClaw](https://github.com/openclaw/openclaw) 证明了另一种可能: 在同样的 agent core 之上, 加两个 harness 机制就能让 agent 从 "踹一下动一下" 变成 "自己隔 30 秒醒一次找活干":
-
-- **心跳 (Heartbeat)** -- 每 30 秒 harness 给 agent 发一条消息, 让它检查有没有事可做。没事就继续睡, 有事立刻行动。
-- **定时任务 (Cron)** -- agent 可以给自己安排未来要做的事, 到点自动执行。
-
-再加上 IM 多通道路由 (WhatsApp/Telegram/Slack/Discord 等 13+ 平台)、不清空的上下文记忆、Soul 人格系统, agent 就从一个临时工具变成了始终在线的个人 AI 助手。
-
-**[claw0](https://github.com/shareAI-lab/claw0)** 是我们的姊妹教学仓库, 从零拆解这些 harness 机制:
-
-```
-claw agent = agent core + heartbeat + cron + IM chat + memory + soul
-```
-
-```
-learn-claude-code                   claw0
-(agent harness 内核:                 (主动式常驻 harness:
- 循环、工具、规划、                    心跳、定时任务、IM 通道、
- 团队、worktree 隔离)                  记忆、Soul 人格)
-```
 
 ## 许可证
 
