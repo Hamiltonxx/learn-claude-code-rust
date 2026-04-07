@@ -109,12 +109,12 @@ The pattern is universal. Only the capabilities change.
 - `references/agent-philosophy.md` - Deep dive into why agents work
 
 **Implementation**:
-- `references/minimal-agent.py` - Complete working agent (~80 lines)
-- `references/tool-templates.py` - Capability definitions
-- `references/subagent-pattern.py` - Context isolation
+- `references/minimal-agent.rs` - Complete working agent (~80 lines, Rust)
+- `references/tool-templates.rs` - Tool trait + 4 core tool implementations
+- `references/subagent-pattern.rs` - Context isolation via isolated messages[]
 
 **Scaffolding**:
-- `scripts/init_agent.py` - Generate new agent projects
+- `scripts/init_agent.sh` - Scaffold a new Rust agent project
 
 ## The Agent Mindset
 
