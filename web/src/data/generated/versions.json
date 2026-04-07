@@ -82,6 +82,659 @@
       ],
       "layer": "tools",
       "source": "use async_trait::async_trait;\nuse learn_claude_code_rust::Tool;\nuse serde_json::{json, Value};\nuse std::process::Command;\n\nstruct BashTool;\n\n#[async_trait]\nimpl Tool for BashTool {\n    fn name(&self) -> &str {\n        \"bash\"\n    }\n\n    fn definition(&self) -> Value {\n        json!({\n            \"name\": \"bash\",\n            \"description\": \"Run a bash command\",\n            \"input_schema\": {\n                \"type\": \"object\",\n                \"properties\": {\n                    \"command\": { \"type\": \"string\" }\n                },\n                \"required\": [\"command\"]\n            }\n        })\n    }\n\n    async fn execute(&self, input: Value) -> String {\n        let command = input[\"command\"].as_str().unwrap_or(\"\");\n        let output = Command::new(\"sh\")\n            .arg(\"-c\")\n            .arg(command)\n            .output()\n            .expect(\"failed to execute\");\n        String::from_utf8_lossy(&output.stdout).to_string()\n            + &String::from_utf8_lossy(&output.stderr)\n    }\n}\n\nstruct ReadFileTool;\n\n#[async_trait]\nimpl Tool for ReadFileTool {\n    fn name(&self) -> &str {\n        \"read_file\"\n    }\n\n    fn definition(&self) -> Value {\n        json!({\n            \"name\": \"read_file\",\n            \"description\": \"Read the contents of a file\",\n            \"input_schema\": {\n                \"type\": \"object\",\n                \"properties\": {\n                    \"path\": { \"type\": \"string\" }\n                },\n                \"required\": [\"path\"]\n            }\n        })\n    }\n\n    async fn execute(&self, input: Value) -> String {\n        let path = input[\"path\"].as_str().unwrap_or(\"\");\n        std::fs::read_to_string(path).unwrap_or_else(|e| e.to_string())\n    }\n}\n\nstruct WriteFileTool;\n\n#[async_trait]\nimpl Tool for WriteFileTool {\n    fn name(&self) -> &str { \"write_file\" }\n\n    fn definition(&self) -> Value {\n        json!({\n            \"name\": \"write_file\",\n            \"description\": \"Write content to a file\",\n            \"input_schema\": {\n                \"type\": \"object\",\n                \"properties\": {\n                    \"path\": { \"type\": \"string\" },\n                    \"content\": { \"type\": \"string\" }\n                },\n                \"required\": [\"path\", \"content\"]\n            }\n        })\n    }\n\n    async fn execute(&self, input: Value) -> String {\n        let path = input[\"path\"].as_str().unwrap_or(\"\");\n        let content = input[\"content\"].as_str().unwrap_or(\"\");\n        std::fs::write(path, content).map(|_| \"ok\".to_string()).unwrap_or_else(|e| e.to_string())\n    }\n}\n\nstruct EditFileTool;\n\n#[async_trait]\nimpl Tool for EditFileTool {\n    fn name(&self) -> &str { \"edit_file\" }\n\n    fn definition(&self) -> Value {\n        json!({\n            \"name\": \"edit_file\",\n            \"description\": \"Replace a string in a file\",\n            \"input_schema\": {\n                \"type\": \"object\",\n                \"properties\": {\n                    \"path\": { \"type\": \"string\" },\n                    \"old_str\": { \"type\": \"string\" },\n                    \"new_str\": { \"type\": \"string\" }\n                },\n                \"required\": [\"path\", \"old_str\", \"new_str\"]\n            }\n        })\n    }\n\n    async fn execute(&self, input: Value) -> String {\n        let path = input[\"path\"].as_str().unwrap_or(\"\");\n        let old = input[\"old_str\"].as_str().unwrap_or(\"\");\n        let new = input[\"new_str\"].as_str().unwrap_or(\"\");\n        match std::fs::read_to_string(path) {\n            Ok(text) => {\n                let updated = text.replace(old, new);\n                std::fs::write(path, updated).map(|_| \"ok\".to_string()).unwrap_or_else(|e| e.to_string())\n            }\n            Err(e) => e.to_string(),\n        }\n    }\n}\n\nuse std::collections::HashMap;\nuse std::io::{Write, stdin, stdout};\n\n#[tokio::main]\nasync fn main() {\n    let api_key = std::env::var(\"ANTHROPIC_API_KEY\").expect(\"ANTHROPIC_API_KEY not set\");\n    let client = reqwest::Client::new();\n\n    // 构建 dispatcher\n    let mut tools: HashMap<String, Box<dyn Tool>> = HashMap::new();\n    tools.insert(\"bash\".to_string(), Box::new(BashTool));\n    tools.insert(\"read_file\".to_string(), Box::new(ReadFileTool));\n    tools.insert(\"write_file\".to_string(), Box::new(WriteFileTool));\n    tools.insert(\"edit_file\".to_string(), Box::new(EditFileTool));\n\n    let tool_defs: Vec<Value> = tools.values().map(|t| t.definition()).collect();\n\n    // 读用户输入\n    print!(\"> \");\n    Write::flush(&mut stdout()).unwrap();\n    let mut input = String::new();\n    stdin().read_line(&mut input).unwrap();\n\n    let mut messages = vec![learn_claude_code_rust::Message {\n        role: \"user\".to_string(),\n        content: serde_json::json!(input.trim()),\n    }];\n\n    // agent loop\n    loop {\n        let response = call_api(&client, &api_key, &messages, &tool_defs).await;\n\n        if response.stop_reason.as_deref() == Some(\"tool_use\") {\n            // 1. 把 assistant 回复加入历史\n            messages.push(learn_claude_code_rust::Message {\n                role: \"assistant\".to_string(),\n                content: serde_json::json!(response.content),\n            });\n\n            // 2. 执行所有 tool_use, 收集结果\n            let mut tool_results = vec![];\n            for block in &response.content {\n                if let learn_claude_code_rust::ContentBlock::ToolUse { id, name, input } = block {\n                    println!(\"[调用工具] {}\", name);\n                    let result = tools[name].execute(input.clone()).await;\n                    tool_results.push(serde_json::json!({\n                        \"type\": \"tool_result\",\n                        \"tool_use_id\": id,\n                        \"content\": result\n                    }));\n                }\n            }\n\n            // 3. 把工具结果作为 user 消息加入历史\n            messages.push(learn_claude_code_rust::Message {\n                role: \"user\".to_string(),\n                content: serde_json::json!(tool_results),\n            });\n        } else {\n            // end_turn, 打印文本回复\n            for block in &response.content {\n                if let learn_claude_code_rust::ContentBlock::Text { text } = block {\n                    println!(\"\\nClaude: {}\", text);\n                }\n            }\n            break;\n        }\n    }\n}\n\nasync fn call_api(client: &reqwest::Client, api_key: &str, messages: &[learn_claude_code_rust::Message], tools: &[Value],) -> learn_claude_code_rust::ApiResponse {\n    let request = learn_claude_code_rust::ApiRequest {\n        model: \"claude-haiku-4-5\".to_string(),\n        max_tokens: 8096,\n        system: \"You are a helpful assistant.\".to_string(),\n        messages: messages.to_vec(),\n        tools: Some(tools.to_vec()),\n    };\n\n    client\n        .post(\"https://api.ofox.ai/anthropic/v1/messages\")\n        .header(\"Authorization\", format!(\"Bearer {}\", api_key))\n        .header(\"anthropic-version\", \"2023-06-01\")\n        .header(\"content-type\", \"application/json\")\n        .json(&request)\n        .send()\n        .await\n        .unwrap()\n        .json::<learn_claude_code_rust::ApiResponse>()\n        .await\n        .unwrap()\n}\n"
+    },
+    {
+      "id": "s03",
+      "filename": "s03_todo.rs",
+      "title": "TodoWrite",
+      "subtitle": "Plan Before You Act",
+      "loc": 203,
+      "tools": [
+        "todo_write",
+        "bash",
+        "write_file"
+      ],
+      "newTools": [
+        "todo_write"
+      ],
+      "coreAddition": "TodoManager + nag reminder",
+      "keyInsight": "An agent without a plan drifts; list the steps first, then execute",
+      "classes": [
+        {
+          "name": "TodoItem",
+          "startLine": 12,
+          "endLine": 15
+        },
+        {
+          "name": "TodoManager",
+          "startLine": 18,
+          "endLine": 20
+        },
+        {
+          "name": "TodoWriteTool",
+          "startLine": 68,
+          "endLine": 69
+        },
+        {
+          "name": "BashTool",
+          "startLine": 107,
+          "endLine": 107
+        },
+        {
+          "name": "WriteFileTool",
+          "startLine": 128,
+          "endLine": 128
+        }
+      ],
+      "functions": [
+        {
+          "name": "main",
+          "signature": "async fn main() {",
+          "startLine": 155
+        },
+        {
+          "name": "call_api",
+          "signature": "async fn call_api(",
+          "startLine": 219
+        }
+      ],
+      "layer": "planning",
+      "source": "use async_trait::async_trait;\nuse learn_claude_code_rust::Tool;\nuse serde_json::{json, Value};\nuse std::collections::HashMap;\nuse std::io::{Write, stdin, stdout};\nuse std::process::Command;\nuse std::sync::{Arc, Mutex};\n\n// --- 数据结构 ---\n\n#[derive(Debug, Clone)]\nstruct TodoItem {\n    id: u32,\n    title: String,\n    status: String,\n}\n\nstruct TodoManager {\n    todos: Vec<TodoItem>,\n    next_id: u32,\n}\n\nimpl TodoManager {\n    fn new() -> Self {\n        TodoManager { todos: vec![], next_id: 1 }\n    }\n\n    fn add(&mut self, title: &str) -> u32 {\n        let id = self.next_id;\n        self.todos.push(TodoItem { id, title: title.to_string(), status: \"pending\".to_string() });\n        self.next_id += 1;\n        id\n    }\n\n    fn list(&self) -> String {\n        if self.todos.is_empty() { return \" (暂无任务) \".to_string(); }\n        self.todos.iter().map(|t| {\n            let icon = match t.status.as_str() {\n                \"done\" => \"✅\",\n                \"in_progress\" => \"🔄\",\n                _ => \"⬜\"\n            };\n            format!(\"{} [{}] {}\", icon, t.id, t.title)\n        })\n        .collect::<Vec<_>>().join(\"\\n\")\n    }\n\n    fn update(&mut self, id: u32, status: &str) -> String {\n        match self.todos.iter_mut().find(|t| t.id == id) {\n            Some(todo) => { todo.status = status.to_string(); format!(\"任务 #{} -> {}\", id, status) }\n            None => format!(\"找不到任务 #{}\", id),\n        }\n    }\n\n    fn delete(&mut self, id: u32) -> String {\n        let before = self.todos.len();\n        self.todos.retain(|t| t.id != id);\n        if self.todos.len() < before {\n            format!(\"已删除 #{}\", id)\n        } else {\n            format!(\"找不到 #{}\", id)\n        }\n    }\n}\n\n// --- TodoWriteTool ---\n\nstruct TodoWriteTool {\n    manager: Arc<Mutex<TodoManager>>,\n}\n\n#[async_trait]\nimpl Tool for TodoWriteTool {\n    fn name(&self) -> &str { \"todo_write\" }\n\n    fn definition(&self) -> Value {\n        json!({\n            \"name\": \"todo_write\",\n            \"description\": \"管理任务列表。执行多步骤任务时，必须先add所有子任务，再逐步执行并更新状态。\",\n            \"input_schema\": {\n                \"type\": \"object\",\n                \"properties\": {\n                    \"action\": { \"type\": \"string\", \"enum\": [\"add\", \"list\", \"update\", \"delete\"] },\n                    \"title\":  { \"type\": \"string\" },\n                    \"id\":     { \"type\": \"integer\" },\n                    \"status\": { \"type\": \"string\", \"enum\": [\"pending\", \"in_progress\", \"done\"] }\n                },\n                \"required\": [\"action\"]\n            }\n        })\n    }\n\n    async fn execute(&self, input: Value) -> String {\n        let mut mgr = self.manager.lock().unwrap();\n        match input[\"action\"].as_str().unwrap_or(\"\") {\n            \"add\" => { let t = input[\"title\"].as_str().unwrap_or(\"未命名\"); format!(\"已添加 #{}: {}\", mgr.add(t), t)}\n            \"list\" => mgr.list(),\n            \"update\" => mgr.update(input[\"id\"].as_u64().unwrap_or(0) as u32, input[\"status\"].as_str().unwrap_or(\"pending\")),\n            \"delete\" => mgr.delete(input[\"id\"].as_u64().unwrap_or(0) as u32),\n            other => format!(\"未知操作: {}\", other),\n        }\n    }\n}\n\n// --- BashTool / WriteFileTool (直接从 s02 照抄) ---\n\nstruct BashTool;\n#[async_trait]\nimpl Tool for BashTool {\n    fn name(&self) -> &str { \"bash\" }\n    fn definition(&self) -> Value {\n        json!({\n            \"name\": \"bash\",\n            \"description\": \"执行 bash 命令\",\n            \"input_schema\": {\n                \"type\": \"object\",\n                \"properties\": { \"command\": { \"type\": \"string\" } },\n                \"required\": [\"command\"]\n            }\n        })\n    }\n    async fn execute(&self, input: Value) -> String {\n        let out = Command::new(\"sh\").arg(\"-c\").arg(input[\"command\"].as_str().unwrap_or(\"\")).output().expect(\"failed\");\n        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr)\n    }\n}\n\nstruct WriteFileTool;\n#[async_trait]\nimpl Tool for WriteFileTool {\n    fn name(&self) -> &str { \"write_file\" }\n    fn definition(&self) -> Value {\n        json!({\n            \"name\": \"write_file\",\n            \"description\": \"写入文件\",\n            \"input_schema\": {\n                \"type\": \"object\",\n                \"properties\": {\n                    \"path\": { \"type\": \"string\" },\n                    \"content\": { \"type\": \"string\" }\n                },\n                \"required\": [\"path\", \"content\"]\n            }\n        })\n    }\n    async fn execute(&self, input: Value) -> String {\n        std::fs::write(input[\"path\"].as_str().unwrap_or(\"\"), input[\"content\"].as_str().unwrap_or(\"\"))\n            .map(|_| \"ok\".to_string()).unwrap_or_else(|e| e.to_string())\n    }\n}\n\n// --- main ---\n\n#[tokio::main]\nasync fn main() {\n    let api_key = std::env::var(\"ANTHROPIC_API_KEY\").expect(\"ANTHROPIC_API_KEY not set\");\n    let client = reqwest::Client::new();\n\n    let manager = Arc::new(Mutex::new(TodoManager::new()));\n\n    let mut tools: HashMap<String, Box<dyn Tool>> = HashMap::new();\n    tools.insert(\"todo_write\".to_string(), Box::new(TodoWriteTool { manager }));\n    tools.insert(\"bash\".to_string(),       Box::new(BashTool));\n    tools.insert(\"write_file\".to_string(), Box::new(WriteFileTool));\n\n    let tool_defs: Vec<Value> = tools.values().map(|t| t.definition()).collect();\n\n    let system = \"你是一个有条理的助手。执行任何多步骤任务时必须：\n        1. 先用 todo_write(add) 把所有子任务列出\n        2. 开始某步前用 todo_write(update, in_progress) 标记\n        3. 完成后用 todo_write(update, done) 标记\n        不允许跳过规划直接执行。\n    \";\n\n    print!(\"> \");\n    Write::flush(&mut stdout()).unwrap();\n    let mut input = String::new();\n    stdin().read_line(&mut input).unwrap();\n\n    let mut messages = vec![learn_claude_code_rust::Message {\n        role: \"user\".to_string(),\n        content: json!(input.trim()),\n    }];\n\n    loop {\n        let response = call_api(&client, &api_key, &messages, &tool_defs, system).await;\n\n        if response.stop_reason.as_deref() == Some(\"tool_use\") {\n            messages.push(learn_claude_code_rust::Message {\n                role: \"assistant\".to_string(),\n                content: json!(response.content),\n            });\n\n            let mut results = vec![];\n            for block in &response.content {\n                if let learn_claude_code_rust::ContentBlock::ToolUse { id, name, input } = block {\n                    println!(\"[工具] {}\", name);\n                    let result = tools[name].execute(input.clone()).await;\n                    println!(\"[结果] {}\", result);\n                    results.push(json!({ \"type\": \"tool_result\", \"tool_use_id\": id, \"content\": result }));\n                }\n            }\n\n            messages.push(learn_claude_code_rust::Message {\n                role: \"user\".to_string(),\n                content: json!(results),\n            });\n        } else {\n            for block in &response.content {\n                if let learn_claude_code_rust::ContentBlock::Text { text } = block {\n                    println!(\"\\nClaude: {}\", text);\n                }\n            }\n            break;\n        }\n    }\n}\n\nasync fn call_api(\n    client: &reqwest::Client, api_key: &str,\n    messages: &[learn_claude_code_rust::Message], tools: &[Value], system: &str,\n) -> learn_claude_code_rust::ApiResponse {\n    let request = learn_claude_code_rust::ApiRequest {\n        model: \"claude-haiku-4-5\".to_string(),\n        max_tokens: 8096,\n        system: system.to_string(),\n        messages: messages.to_vec(),\n        tools: Some(tools.to_vec()),\n    };\n    client.post(\"https://api.ofox.ai/anthropic/v1/messages\")\n        .header(\"Authorization\", format!(\"Bearer {}\", api_key))\n        .header(\"anthropic-version\", \"2023-06-01\")\n        .header(\"content-type\", \"application/json\")\n        .json(&request).send().await.unwrap()\n        .json::<learn_claude_code_rust::ApiResponse>().await.unwrap()\n}\n"
+    },
+    {
+      "id": "s04",
+      "filename": "s04_subagent.rs",
+      "title": "Subagents",
+      "subtitle": "Clean Context Per Subtask",
+      "loc": 211,
+      "tools": [
+        "bash",
+        "write_file",
+        "read_file",
+        "dispatch_agent"
+      ],
+      "newTools": [
+        "read_file",
+        "dispatch_agent"
+      ],
+      "coreAddition": "Subagent spawn with isolated messages[]",
+      "keyInsight": "Subagents use independent messages[], keeping the main conversation clean",
+      "classes": [
+        {
+          "name": "BashTool",
+          "startLine": 11,
+          "endLine": 11
+        },
+        {
+          "name": "WriteFileTool",
+          "startLine": 34,
+          "endLine": 34
+        },
+        {
+          "name": "ReadFileTool",
+          "startLine": 58,
+          "endLine": 58
+        },
+        {
+          "name": "DispatchAgentTool",
+          "startLine": 132,
+          "endLine": 134
+        }
+      ],
+      "functions": [
+        {
+          "name": "agent_loop",
+          "signature": "async fn agent_loop(",
+          "startLine": 85
+        },
+        {
+          "name": "main",
+          "signature": "async fn main() {",
+          "startLine": 177
+        },
+        {
+          "name": "call_api",
+          "signature": "async fn call_api(",
+          "startLine": 235
+        }
+      ],
+      "layer": "planning",
+      "source": "use async_trait::async_trait;\nuse learn_claude_code_rust::Tool;\nuse serde_json::{json, Value};\nuse std::collections::HashMap;\nuse std::io::{Write as IoWrite, stdin, stdout};\nuse std::process::Command;\nuse std::sync::Arc;\n\n// --- 基础工具 (照抄 s03) ---\n\nstruct BashTool;\n#[async_trait]\nimpl Tool for BashTool {\n    fn name(&self) -> &str { \"bash\" }\n    fn definition(&self) -> Value {\n        json!({\n            \"name\": \"bash\",\n            \"description\": \"执行 bash 命令\",\n            \"input_schema\": {\n                \"type\": \"object\",\n                \"properties\": {\n                    \"command\": { \"type\": \"string\" }\n                },\n                \"required\": [\"command\"]\n            }\n        })\n    }\n    async fn execute(&self, input: Value) -> String {\n        let out = Command::new(\"sh\").arg(\"-c\").arg(input[\"command\"].as_str().unwrap_or(\"\")).output().expect(\"failed\");\n        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr)\n    }\n}\n\nstruct WriteFileTool;\n#[async_trait]\nimpl Tool for WriteFileTool {\n    fn name(&self) -> &str { \"write_file\" }\n    fn definition(&self) -> Value {\n        json!({\n            \"name\": \"write_file\",\n            \"description\": \"写入文件\",\n            \"input_schema\": {\n                \"type\": \"object\",\n                \"properties\": {\n                    \"path\": { \"type\": \"string\" },\n                    \"content\": { \"type\": \"string\" }\n                },\n                \"required\": [\"path\", \"content\"]\n            }\n        })\n    }\n    async fn execute(&self, input: Value) -> String {\n        std::fs::write(input[\"path\"].as_str().unwrap_or(\"\"), input[\"content\"].as_str().unwrap_or(\"\"))\n            .map(|_| \"ok\".to_string()).unwrap_or_else(|e| e.to_string())\n    }\n}\n\nstruct ReadFileTool;\n#[async_trait]\nimpl Tool for ReadFileTool {\n    fn name(&self) -> &str { \"read_file\" }\n    fn definition(&self) -> Value {\n        json!({\n            \"name\": \"read_file\",\n            \"description\": \"读取文件\",\n            \"input_schema\": {\n                \"type\": \"object\",\n                \"properties\": {\n                    \"path\": { \"type\": \"string\" }\n                },\n                \"required\": [\"path\"]\n            }\n        })\n    }\n    async fn execute(&self, input: Value) -> String {\n        std::fs::read_to_string(input[\"path\"].as_str().unwrap_or(\"\")).unwrap_or_else(|e| e.to_string())\n    }\n}\n\n// --- agent_loop: 子 agent 的独立循环 ---\n//\n// 关键: messages 是局部变量，和调用方完全隔离\n// 返回子 agent 的最终文本输出\n\nasync fn agent_loop(\n    client: &reqwest::Client,\n    api_key: &str,\n    task: &str,\n    tools: &HashMap<String, Box<dyn Tool>>,\n    tool_defs: &[Value],\n) -> String {\n    let mut messages = vec![learn_claude_code_rust::Message {\n        role: \"user\".to_string(),\n        content: json!(task),\n    }];\n\n    loop {\n        let response = call_api(client, api_key, &messages, tool_defs, \"你是一个能干的助手。\").await;\n\n        if response.stop_reason.as_deref() == Some(\"tool_use\") {\n            messages.push(learn_claude_code_rust::Message {\n                role: \"assistant\".to_string(),\n                content: json!(response.content),\n            });\n\n            let mut results = vec![];\n            for block in &response.content {\n                if let learn_claude_code_rust::ContentBlock::ToolUse{ id, name, input } = block {\n                    println!(\" [子agent工具] {}\", name);\n                    let result = tools[name].execute(input.clone()).await;\n                    results.push(json!({ \"type\": \"tool_result\", \"tool_use_id\": id, \"content\": result }));\n                }\n            }\n\n            messages.push(learn_claude_code_rust::Message {\n                role: \"user\".to_string(),\n                content: json!(results),\n            });\n        } else {\n            // 收集子 agent 的文本输出并返回\n            return response.content.iter().filter_map(|b| if let learn_claude_code_rust::ContentBlock::Text {text} = b {\n                Some(text.clone())\n            } else { None })\n                .collect::<Vec<_>>()\n                .join(\"\\n\");\n        }\n    }\n}\n\n// --- DispatchAgentTool ---\n\nstruct DispatchAgentTool {\n    client: Arc<reqwest::Client>,\n    api_key: Arc<String>,\n}\n\n#[async_trait]\nimpl Tool for DispatchAgentTool {\n    fn name(&self) -> &str { \"dispatch_agent\" }\n\n    fn definition(&self) -> Value {\n        json!({\n            \"name\": \"dispatch_agent\",\n            \"description\": \"派生一个子agent来完成独立的子任务。子agent有自己的对话历史，完成后返回结果。\",\n            \"input_schema\": {\n                \"type\": \"object\",\n                \"properties\": {\n                    \"task\": { \"type\": \"string\", \"description\": \"交给子agent的任务描述\" }\n                },\n                \"required\": [\"task\"]\n            }\n        })\n    }\n\n    async fn execute(&self, input: Value) -> String {\n        let task = input[\"task\"].as_str().unwrap_or(\"\").to_string();\n        println!(\"[派生子agent]任务: {}\", task);\n\n        // 子agent有自己独立的工具集\n        let mut sub_tools: HashMap<String, Box<dyn Tool>> = HashMap::new();\n        sub_tools.insert(\"bash\".to_string(),        Box::new(BashTool));\n        sub_tools.insert(\"write_file\".to_string(),  Box::new(WriteFileTool));\n        sub_tools.insert(\"read_file\".to_string(),   Box::new(ReadFileTool));\n\n        let sub_tool_defs: Vec<Value> = sub_tools.values().map(|t| t.definition()).collect();\n\n        // 调用独立的 agent_loop, messages 完全隔离\n        let result = agent_loop(&self.client, &self.api_key, &task, &sub_tools, &sub_tool_defs).await;\n        println!(\"[子agent完成]\");\n        result\n    }\n}\n\n// --- main ---\n\n#[tokio::main]\nasync fn main() {\n    let api_key = Arc::new(std::env::var(\"ANTHROPIC_API_KEY\").expect(\"ANTHROPIC_API_KEY not set\"));\n    let client = Arc::new(reqwest::Client::new());\n\n    // 主 agent 只有 dispatch_agent 工具\n    let mut tools: HashMap<String, Box<dyn Tool>> = HashMap::new();\n    tools.insert(\"dispatch_agent\".to_string(), Box::new(DispatchAgentTool {\n        client: client.clone(),\n        api_key: api_key.clone(),\n    }));\n\n    let tool_defs: Vec<Value> = tools.values().map(|t| t.definition()).collect();\n\n    let system = \"你是一个任务协调者。收到复杂任务时，把它拆成若干独立子任务，用 dispatch_agent 工具逐一派发执行。\";\n\n    print!(\"> \");\n    IoWrite::flush(&mut stdout()).unwrap();\n    let mut input = String::new();\n    stdin().read_line(&mut input).unwrap();\n\n    let mut messages = vec![learn_claude_code_rust::Message {\n        role: \"user\".to_string(),\n        content: json!(input.trim()),\n    }];\n\n    loop {\n        let response = call_api(&client, &api_key, &messages, &tool_defs, system).await;\n\n        if response.stop_reason.as_deref() == Some(\"tool_use\") {\n            messages.push(learn_claude_code_rust::Message {\n                role: \"assistant\".to_string(),\n                content: json!(response.content),\n            });\n\n            let mut results = vec![];\n            for block in &response.content {\n                if let learn_claude_code_rust::ContentBlock::ToolUse { id, name, input } = block {\n                    println!(\"[主agent工具] {}\", name);\n                    let result = tools[name].execute(input.clone()).await;\n                    results.push(json!({ \"type\": \"tool_result\", \"tool_use_id\": id, \"content\": result }));\n                }\n            }\n\n            messages.push(learn_claude_code_rust::Message {\n                role: \"user\".to_string(),\n                content: json!(results),\n            });\n        } else {\n            for block in &response.content {\n                if let learn_claude_code_rust::ContentBlock::Text { text } = block {\n                    println!(\"\\nClaude: {}\", text);\n                }\n            }\n            break;\n        }\n    }\n}\n\nasync fn call_api(\n    client: &reqwest::Client, api_key: &str,\n    messages: &[learn_claude_code_rust::Message], tools: &[Value], system: &str,\n) -> learn_claude_code_rust::ApiResponse {\n    let request = learn_claude_code_rust::ApiRequest {\n        model: \"claude-haiku-4-5\".to_string(),\n        max_tokens: 8096,\n        system: system.to_string(),\n        messages: messages.to_vec(),\n        tools: Some(tools.to_vec()),\n    };\n    client.post(\"https://api.ofox.ai/anthropic/v1/messages\")\n        .header(\"Authorization\", format!(\"Bearer {}\", api_key))\n        .header(\"anthropic-version\", \"2023-06-01\")\n        .header(\"content-type\", \"application/json\")\n        .json(&request).send().await.unwrap()\n        .json::<learn_claude_code_rust::ApiResponse>().await.unwrap()\n}\n"
+    },
+    {
+      "id": "s05",
+      "filename": "s05_skill_loading.rs",
+      "title": "Skills",
+      "subtitle": "Load on Demand",
+      "loc": 172,
+      "tools": [
+        "load_skill",
+        "bash"
+      ],
+      "newTools": [
+        "load_skill"
+      ],
+      "coreAddition": "SkillLoader + two-layer injection",
+      "keyInsight": "Inject knowledge via tool_result when needed, not upfront in the system prompt",
+      "classes": [
+        {
+          "name": "SkillLoaderTool",
+          "startLine": 9,
+          "endLine": 10
+        },
+        {
+          "name": "BashTool",
+          "startLine": 64,
+          "endLine": 65
+        }
+      ],
+      "functions": [
+        {
+          "name": "list_skills",
+          "signature": "fn list_skills() -> Vec<String> {",
+          "startLine": 54
+        },
+        {
+          "name": "agent_loop",
+          "signature": "async fn agent_loop(",
+          "startLine": 99
+        },
+        {
+          "name": "main",
+          "signature": "async fn main() {",
+          "startLine": 159
+        },
+        {
+          "name": "call_api",
+          "signature": "async fn call_api(",
+          "startLine": 187
+        }
+      ],
+      "layer": "planning",
+      "source": "use async_trait::async_trait;\nuse learn_claude_code_rust::{ApiRequest, ApiResponse, ContentBlock, Message, Tool};\nuse serde_json::{json, Value};\nuse std::collections::HashMap;\nuse std::io::{Write as IoWrite, stdin, stdout};\n\n// SkillLoaderTool: 按需加载 skills/ 下的 .md 文件\n\nstruct SkillLoaderTool;\n\n#[async_trait]\nimpl Tool for SkillLoaderTool {\n    fn name(&self) -> &str {\n        \"load_skill\"\n    }\n\n    fn definition(&self) -> Value {\n        json!({\n            \"name\": \"load_skill\",\n            \"description\": \"加载指定技能的知识文档。当你需要某个领域的专业知识时调用此工具。\",\n            \"input_schema\": {\n                \"type\": \"object\",\n                \"properties\": {\n                    \"skill_name\": {\n                        \"type\": \"string\",\n                        \"description\": \"技能名称，对应 skills/ 目录下的子目录名，例如 'agent-builder'、'code-review'\"\n                    }\n                },\n                \"required\": [\"skill_name\"]\n            }\n        })\n    }\n\n    async fn execute(&self, input: Value) -> String {\n        let skill_name = input[\"skill_name\"].as_str().unwrap_or(\"\");\n        let path = format!(\"skills/{}/SKILL.md\", skill_name);\n\n        match std::fs::read_to_string(&path) {\n            Ok(content) => {\n                println!(\" [加载技能] {} ({} 字节)\", skill_name, content.len());\n                content\n            }\n            Err(_) => {\n                // 列出可用 skill 供模型参考\n                let available = list_skills();\n                format!(\"技能 '{}' 不存在。可用技能: {}\", skill_name, available.join(\", \"))\n            }\n        }\n    }  \n}\n\n\n// 列出 skills/ 下的所有子目录名\nfn list_skills() -> Vec<String> {\n    std::fs::read_dir(\"skills\").into_iter().flatten()\n        .filter_map(|e| e.ok())\n        .filter(|e| e.path().is_dir())\n        .filter_map(|e| e.file_name().into_string().ok())\n        .collect()\n}\n\n// BashTool (复用，方便 agent 做实际操作)\n\nstruct BashTool;\n\n#[async_trait]\nimpl Tool for BashTool {\n    fn name(&self) -> &str {\n        \"bash\"\n    }\n\n    fn definition(&self) -> Value {\n        json!({\n            \"name\": \"bash\",\n            \"description\": \"执行 bash 命令\",\n            \"input_schema\": {\n                \"type\": \"object\",\n                \"properties\": {\n                    \"command\": { \"type\": \"string\" }\n                },\n                \"required\": [\"command\"]\n            }\n        })\n    }\n\n    async fn execute(&self, input: Value) -> String {\n        let out = std::process::Command::new(\"sh\")\n            .arg(\"-c\")\n            .arg(input[\"command\"].as_str().unwrap_or(\"\"))\n            .output()\n            .expect(\"failed\");\n        String::from_utf8_lossy(&out.stdout).to_string()\n            + &String::from_utf8_lossy(&out.stderr)\n    }\n}\n\n// agent loop\n\nasync fn agent_loop(\n    client: &reqwest::Client,\n    api_key: &str,\n    system: &str,\n    tools: &HashMap<String, Box<dyn Tool>>,\n    tool_defs: &[Value],\n    initial_message: &str,\n) {\n    let mut messages = vec![Message {\n        role: \"user\".to_string(),\n        content: json!(initial_message),\n    }];\n\n    loop {\n        let response = call_api(client, api_key, &messages, tool_defs, system).await;\n\n        match response.stop_reason.as_deref() {\n            Some(\"tool_use\") => {\n                // 1. 把 assistant 的 tool_use 加入历史\n                messages.push(Message {\n                    role: \"assistant\".to_string(),\n                    content: json!(response.content),\n                });\n\n                // 2. 执行每个工具，收集结果\n                let mut results = vec![];\n                for block in &response.content {\n                    if let ContentBlock::ToolUse { id, name, input } = block {\n                        println!(\"[工具调用] {}\", name);\n                        let result = tools[name].execute(input.clone()).await;\n                        results.push(json!({\n                            \"type\": \"tool_result\",\n                            \"tool_use_id\": id,\n                            \"content\": result\n                        }));\n                    }\n                }\n\n                // 3. 把 tool_result 加入历史，继续循环\n                messages.push(Message {\n                    role: \"user\".to_string(),\n                    content: json!(results),\n                });\n            }\n            _ => {\n                // end_turn: 输出最终文本\n                for block in &response.content {\n                    if let ContentBlock::Text { text } = block {\n                        println!(\"\\nClaude: {}\", text);\n                    }\n                }\n                break;\n            }\n        }\n    }\n}\n\n// --- main ---\n\n#[tokio::main]\nasync fn main() {\n    let api_key = std::env::var(\"ANTHROPIC_API_KEY\").expect(\"ANTHROPIC_API_KEY not set\");\n    let client = reqwest::Client::new();\n\n    let mut tools: HashMap<String, Box<dyn Tool>> = HashMap::new();\n    tools.insert(\"load_skill\".to_string(), Box::new(SkillLoaderTool));\n    tools.insert(\"bash\".to_string(), Box::new(BashTool));\n\n    let tool_defs: Vec<Value> = tools.values().map(|t| t.definition()).collect();\n\n    // system prompt 告知模型有哪些可用技能\n    let available = list_skills().join(\", \");\n    let system = format!(\"你是一个知识丰富的助手。当你需要特定领域的专业知识时，用 load_skill 工具加载对应技能文档。\\n可用技能: {}\", available);\n\n    loop {\n        print!(\"\\n> \");\n        IoWrite::flush(&mut stdout()).unwrap();\n        let mut input = String::new();\n        stdin().read_line(&mut input).unwrap();\n        let input = input.trim();\n        if input == \"exit\" { break; }\n\n        agent_loop(&client, &api_key, &system, &tools, &tool_defs, input).await;\n    }\n}\n\n// call_api (同前几个 session)\n\nasync fn call_api(\n    client: &reqwest::Client,\n    api_key: &str,\n    messages: &[Message],\n    tools: &[Value],\n    system: &str,\n) -> ApiResponse {\n    let request = ApiRequest {\n        model: \"claude-haiku-4-5\".to_string(),\n        max_tokens: 8096,\n        system: system.to_string(),\n        messages: messages.to_vec(),\n        tools: Some(tools.to_vec()),\n    };\n    client.post(\"https://api.ofox.ai/anthropic/v1/messages\")\n        .header(\"Authorization\", format!(\"Bearer {}\", api_key))\n        .header(\"anthropic-version\", \"2023-06-01\")\n        .header(\"content-type\", \"application/json\")\n        .json(&request)\n        .send()\n        .await\n        .unwrap()\n        .json::<ApiResponse>()\n        .await\n        .unwrap()\n}\n"
+    },
+    {
+      "id": "s06",
+      "filename": "s06_context_compact.rs",
+      "title": "Compact",
+      "subtitle": "Three-Layer Compression",
+      "loc": 213,
+      "tools": [
+        "load_skill",
+        "bash"
+      ],
+      "newTools": [],
+      "coreAddition": "micro-compact + auto-compact + archival",
+      "keyInsight": "Context will fill up; three-layer compression strategy enables infinite sessions",
+      "classes": [
+        {
+          "name": "SkillLoaderTool",
+          "startLine": 12,
+          "endLine": 13
+        },
+        {
+          "name": "BashTool",
+          "startLine": 61,
+          "endLine": 62
+        }
+      ],
+      "functions": [
+        {
+          "name": "list_skills",
+          "signature": "fn list_skills() -> Vec<String> {",
+          "startLine": 51
+        },
+        {
+          "name": "summarize",
+          "signature": "async fn summarize(",
+          "startLine": 95
+        },
+        {
+          "name": "maybe_compact",
+          "signature": "async fn maybe_compact(",
+          "startLine": 129
+        },
+        {
+          "name": "agent_loop",
+          "signature": "async fn agent_loop(",
+          "startLine": 155
+        },
+        {
+          "name": "main",
+          "signature": "async fn main() {",
+          "startLine": 214
+        },
+        {
+          "name": "call_api",
+          "signature": "async fn call_api(",
+          "startLine": 241
+        }
+      ],
+      "layer": "memory",
+      "source": "use async_trait::async_trait;\nuse learn_claude_code_rust::{ApiRequest, ApiResponse, ContentBlock, Message, Tool};\nuse serde_json::{json, Value};\nuse std::collections::HashMap;\nuse std::io::{{Write as IoWrite, stdin, stdout}};\n\nconst COMPACT_THRESHOLD: usize = 20;  // 超过这个数触发压缩\nconst KEEP_RECENT: usize = 10;        // 保留最近 N 条原文\n\n// SkillLoaderTool (同 S05)\n\nstruct SkillLoaderTool;\n\n#[async_trait]\nimpl Tool for SkillLoaderTool {\n    fn name(&self) -> &str { \"load_skill\" }\n    \n    fn definition(&self) -> Value {\n        json!({\n            \"name\": \"load_skill\",\n            \"description\": \"加载指定技能的知识文档。当你需要某个领域的专业知识时调用此工具。\",\n            \"input_schema\": {\n                \"type\": \"object\",\n                \"properties\": {\n                    \"skill_name\": {\n                        \"type\": \"string\",\n                        \"description\": \"技能名称，对应 skills/ 目录下的子目录名\"\n                    }\n                },\n                \"required\": [\"skill_name\"]\n            }\n        })\n    }\n\n    async fn execute(&self, input: Value) -> String {\n        let skill_name = input[\"skill_name\"].as_str().unwrap_or(\"\");\n        let path = format!(\"skills/{}/SKILL.md\", skill_name);\n        match std::fs::read_to_string(&path) {\n            Ok(content) => {\n                println!(\" [加载技能] {} ({} 字节)\", skill_name, content.len());\n                content\n            }\n            Err(_) => {\n                let available = list_skills();\n                format!(\"技能 '{}' 不存在。可用技能: {}\", skill_name, available.join(\", \"))\n            }\n        }\n    }\n}\n\nfn list_skills() -> Vec<String> {\n    std::fs::read_dir(\"skills\").into_iter().flatten()\n        .filter_map(|e| e.ok())\n        .filter(|e| e.path().is_dir())\n        .filter_map(|e| e.file_name().into_string().ok())\n        .collect()\n}\n\n// BashTool (同 S05)\n\nstruct BashTool;\n\n#[async_trait]\nimpl Tool for BashTool {\n    fn name(&self) -> &str { \"bash\" }\n\n    fn definition(&self) -> Value {\n        json!({\n            \"name\": \"bash\",\n            \"description\": \"执行 bash 命令\",\n            \"input_schema\": {\n                \"type\": \"object\",\n                \"properties\": {\n                    \"command\": { \"type\": \"string\" }\n                },\n                \"required\": [\"command\"]\n            }\n        })\n    }\n\n    async fn execute(&self, input: Value) -> String {\n        let out = std::process::Command::new(\"sh\")\n            .arg(\"-c\")\n            .arg(input[\"command\"].as_str().unwrap_or(\"\"))\n            .output()\n            .expect(\"failed\");\n        String::from_utf8_lossy(&out.stdout).to_string()\n            + &String::from_utf8_lossy(&out.stderr)\n    }\n}\n\n// S06 新增: 上下文压缩\n\n// 把一批消息的内容拼成文本，发给模型生成摘要\nasync fn summarize(\n    client: &reqwest::Client,\n    api_key: &str,\n    messages: &[Message],\n) -> String {\n    let text = messages.iter().map(|m| {\n        format!(\"{}: {}\", m.role, m.content)\n    }).collect::<Vec<_>>().join(\"\\n\");\n\n    let req = ApiRequest {\n        model: \"claude-haiku-4-5\".to_string(),\n        max_tokens: 1024,\n        system: \"请将以下对话历史压缩成简洁摘要，保留关键信息、已完成的操作和重要结论。\".to_string(),\n        messages: vec![Message {\n            role: \"user\".to_string(),\n            content: json!(text),\n        }],\n        tools: None,\n    };\n\n    let resp = client.post(\"https://api.ofox.ai/anthropic/v1/messages\")\n        .header(\"Authorization\", format!(\"Bearer {}\", api_key))\n        .header(\"anthropic-version\", \"2023-06-01\")\n        .header(\"content-type\", \"application/json\")\n        .json(&req)\n        .send().await.unwrap()\n        .json::<ApiResponse>().await.unwrap();\n\n    resp.content.iter().filter_map(|b| {\n        if let ContentBlock::Text { text } = b { Some(text.clone()) } else { None }\n    }).collect::<Vec<_>>().join(\"\\n\")\n}\n\n// 每轮循环前检查，超过阈值则压缩\nasync fn maybe_compact(\n    client: &reqwest::Client,\n    api_key: &str,\n    messages: &mut Vec<Message>,\n) {\n    if messages.len() < COMPACT_THRESHOLD {\n        return;\n    }\n\n    // 取出前面要压缩的部分 (保留最近 KEEP_RECENT 条)\n    let to_compress: Vec<Message> = messages.drain(..COMPACT_THRESHOLD - KEEP_RECENT).collect();\n    println!(\"[压缩] 将 {} 条消息压缩为摘要...\", to_compress.len());\n\n    let summary = summarize(client, api_key, &to_compress).await;\n\n    // 把摘要作为 user 信息插回最前面\n    messages.insert(0, Message {\n        role: \"user\".to_string(),\n        content: json!(format!(\"[对话历史摘要]\\n{}\", summary)),\n    });\n\n    println!(\"[压缩完成] 剩余消息数: {}\", messages.len());\n}\n\n// agent loop (在每轮开始调用 maybe_compact)\n\nasync fn agent_loop(\n    client: &reqwest::Client,\n    api_key: &str,\n    system: &str,\n    tools: &HashMap<String, Box<dyn Tool>>,\n    tool_defs: &[Value],\n    initial_message: &str,\n) {\n    let mut messages = vec![Message {\n        role: \"user\".to_string(),\n        content: json!(initial_message),\n    }];\n\n    loop {\n        // S06 新增: 每轮开始前检查是否需要压缩\n        maybe_compact(client, api_key, &mut messages).await;\n\n        let response = call_api(client, api_key, &messages, tool_defs, system).await;\n\n        match response.stop_reason.as_deref() {\n            Some(\"tool_use\") => {\n                messages.push(Message {\n                    role: \"assistant\".to_string(),\n                    content: json!(response.content),\n                });\n\n                let mut results = vec![];\n                for block in &response.content {\n                    if let ContentBlock::ToolUse { id, name, input } = block {\n                        println!(\"[工具调用] {}\", name);\n                        let result = tools[name].execute(input.clone()).await;\n                        results.push(json!({\n                            \"type\": \"tool_result\",\n                            \"tool_use_id\": id,\n                            \"content\": result\n                        }));\n                    }\n                }\n\n                messages.push(Message {\n                    role: \"user\".to_string(),\n                    content: json!(results),\n                });\n            }\n            _ => {\n                for block in &response.content {\n                    if let ContentBlock::Text { text } = block {\n                        println!(\"\\nClaude: {}\", text);\n                    }\n                }\n                break;\n            }\n        }\n    }\n}\n\n// main\n\n#[tokio::main]\nasync fn main() {\n    let api_key = std::env::var(\"ANTHROPIC_API_KEY\").expect(\"ANTHROPIC_API_KEY not set\");\n    let client = reqwest::Client::new();\n\n    let mut tools: HashMap<String, Box<dyn Tool>> = HashMap::new();\n    tools.insert(\"load_skill\".to_string(), Box::new(SkillLoaderTool));\n    tools.insert(\"bash\".to_string(), Box::new(BashTool));\n\n    let tool_defs: Vec<Value> = tools.values().map(|t| t.definition()).collect();\n\n    let available = list_skills().join(\", \");\n    let system = format!(\"你是一个知识丰富的助手。当你需要特定领域的专业知识时，用 load_skill 工具加载对应技能文档。\\n可用技能: {}\", available);\n\n    loop {\n        print!(\"\\n> \");\n        IoWrite::flush(&mut stdout()).unwrap();\n        let mut input = String::new();\n        stdin().read_line(&mut input).unwrap();\n        let input = input.trim();\n        if input == \"exit\" { break; }\n\n        agent_loop(&client, &api_key, &system, &tools, &tool_defs, input).await;\n    }\n}\n\n// call_api\n\nasync fn call_api(\n    client: &reqwest::Client,\n    api_key: &str,\n    messages: &[Message],\n    tools: &[Value],\n    system: &str,\n) -> ApiResponse {\n    let request = ApiRequest {\n        model: \"claude-haiku-4-5\".to_string(),\n        max_tokens: 8096,\n        system: system.to_string(),\n        messages: messages.to_vec(),\n        tools: Some(tools.to_vec()),\n    };\n    client.post(\"https://api.ofox.ai/anthropic/v1/messages\")\n        .header(\"Authorization\", format!(\"Bearer {}\", api_key))\n        .header(\"anthropic-version\", \"2023-06-01\")\n        .header(\"content-type\", \"application/json\")\n        .json(&request)\n        .send().await.unwrap()\n        .json::<ApiResponse>().await.unwrap()\n}\n"
+    },
+    {
+      "id": "s07",
+      "filename": "s07_task_system.rs",
+      "title": "Tasks",
+      "subtitle": "Task Graph + Dependencies",
+      "loc": 305,
+      "tools": [
+        "create_task",
+        "update_task",
+        "list_tasks",
+        "get_next_tasks"
+      ],
+      "newTools": [
+        "create_task",
+        "update_task",
+        "list_tasks",
+        "get_next_tasks"
+      ],
+      "coreAddition": "TaskManager with file-based state + dependency graph",
+      "keyInsight": "A file-based task graph with ordering, parallelism, and dependencies -- the coordination backbone for multi-agent work",
+      "classes": [
+        {
+          "name": "Task",
+          "startLine": 30,
+          "endLine": 34
+        },
+        {
+          "name": "TaskManager",
+          "startLine": 39,
+          "endLine": 42
+        },
+        {
+          "name": "CreateTaskTool",
+          "startLine": 153,
+          "endLine": 154
+        },
+        {
+          "name": "UpdateTaskTool",
+          "startLine": 184,
+          "endLine": 185
+        },
+        {
+          "name": "ListTasksTool",
+          "startLine": 219,
+          "endLine": 220
+        },
+        {
+          "name": "GetNextTasksTool",
+          "startLine": 246,
+          "endLine": 247
+        }
+      ],
+      "functions": [
+        {
+          "name": "call_api",
+          "signature": "async fn call_api(",
+          "startLine": 271
+        },
+        {
+          "name": "main",
+          "signature": "async fn main() {",
+          "startLine": 298
+        }
+      ],
+      "layer": "planning",
+      "source": "use async_trait::async_trait;\nuse learn_claude_code_rust::Tool;\nuse serde::{Deserialize, Serialize};\nuse serde_json::{json, Value};\nuse std::collections::{HashMap, VecDeque};\nuse std::io::{Write as IoWrite, stdin, stdout};\nuse std::sync::{Arc, Mutex};\n\n// Task 数据结构\n\n#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]\n#[serde(rename_all = \"snake_case\")]\nenum TaskStatus {\n    Todo,\n    InProgress,\n    Done,\n}\n\nimpl std::fmt::Display for TaskStatus {\n    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        match self {\n            TaskStatus::Todo => write!(f, \"todo\"),\n            TaskStatus::InProgress => write!(f, \"in_progress\"),\n            TaskStatus::Done => write!(f, \"done\"),\n        }\n    }\n}\n\n#[derive(Debug, Clone, Serialize, Deserialize)]\nstruct Task {\n    id: String,\n    title: String,\n    status: TaskStatus,\n    deps: Vec<String>, // 依赖的 task id 列表\n}\n\n// TaskManager: CRUD + 持久化 + 拓扑排序\n\nstruct TaskManager {\n    tasks: Vec<Task>,\n    path: String,\n    next_id: u32,\n}\n\nimpl TaskManager {\n    /// 从 JSON 文件加载，文件不存在则创建空的 TaskManager\n    fn load(path: &str) -> Self {\n        if let Ok(content) = std::fs::read_to_string(path) {\n            if let Ok(tasks) = serde_json::from_str::<Vec<Task>>(&content) {\n                let next_id = tasks.iter().filter_map(|t| t.id.parse::<u32>().ok())\n                    .max().unwrap_or(0) + 1;\n                return TaskManager { tasks, path: path.to_string(), next_id };\n            }\n        }\n        TaskManager { tasks: vec![], path: path.to_string(), next_id: 1 }\n    }\n\n    /// 持久化到 JSON 文件\n    fn save(&self) -> Result<(), String> {\n        let json = serde_json::to_string_pretty(&self.tasks).map_err(|e| e.to_string())?;\n        std::fs::write(&self.path, json).map_err(|e| e.to_string())\n    }\n\n    /// 新建任务，返回新任务的 id\n    fn add(&mut self, title: &str, deps: Vec<String>) -> Result<String, String> {\n        // 检查依赖的 id 是否存在\n        for dep in &deps {\n            if !self.tasks.iter().any(|t| &t.id == dep) {\n                return Err(format!(\"依赖的任务 id {} 不存在\", dep));\n            }\n        }\n        let id = self.next_id.to_string();\n        self.next_id += 1;\n        self.tasks.push(Task {\n            id: id.clone(),\n            title: title.to_string(),\n            status: TaskStatus::Todo,\n            deps,\n        });\n        self.save()?;\n        Ok(id)\n    }\n\n    /// 更新任务状态\n    fn update_status(&mut self, id: &str, status: TaskStatus) -> Result<(), String> {\n        let task = self.tasks.iter_mut().find(|t| t.id == id)\n            .ok_or_else(|| format!(\"任务 id {} 不存在\", id))?;\n        task.status = status;\n        self.save()\n    }\n\n    /// Kahn 算法拓扑排序，返回任务列表 (按依赖顺序)\n    /// 有环时返回 Err\n    fn topo_sort(&self) -> Result<Vec<Task>, String> {\n        // 建立 id -> index 映射\n        let index: HashMap<&str, usize> = self.tasks\n            .iter()\n            .enumerate()\n            .map(|(i,t)| (t.id.as_str(), i))\n            .collect();\n\n        // task 的入度 =  它的 deps 数量\n        let mut in_degree: Vec<usize> = self.tasks.iter().map(|t| t.deps.len()).collect();\n\n        // 邻接表: dep 完成后, 能减少哪些任务的入度\n        let mut dependents: Vec<Vec<usize>> = vec![vec![]; self.tasks.len()];\n        for (i, task) in self.tasks.iter().enumerate() {\n            for dep in &task.deps {\n                if let Some(&j) = index.get(dep.as_str()) {\n                    dependents[j].push(i);\n                }\n            }\n        }\n\n        let mut queue: VecDeque<usize> = in_degree\n            .iter()\n            .enumerate()\n            .filter(|&(_, &d)| d == 0)\n            .map(|(i, _)| i)\n            .collect();\n\n        let mut result = vec![];\n        while let Some(i) = queue.pop_front() {\n            result.push(self.tasks[i].clone());\n            for &next in &dependents[i] {\n                in_degree[next] -= 1;\n                if in_degree[next] == 0 {\n                    queue.push_back(next);\n                }\n            }\n        }\n\n        if result.len() != self.tasks.len() {\n            return Err(\"任务依赖中存在循环\".to_string());\n        }\n        Ok(result)\n    }\n\n    // 返回依赖全部完成、可立即开始的 Todo 任务\n    fn get_next_tasks(&self) -> Vec<&Task> {\n        self.tasks.iter().filter(|t| {\n            t.status == TaskStatus::Todo && t.deps.iter().all(|dep_id| {\n                self.tasks.iter().any(|d| &d.id == dep_id && d.status == TaskStatus::Done)\n            })\n        }).collect()\n    }\n}\n\n// 工具\n\ntype SharedManager = Arc<Mutex<TaskManager>>;\n\nstruct CreateTaskTool(SharedManager);\n\n#[async_trait]\nimpl Tool for CreateTaskTool {\n    fn name(&self) -> &str { \"create_task\" }\n    fn definition(&self) -> Value {\n        json!({\n            \"name\": \"create_task\",\n            \"description\": \"创建新任务, 可指定依赖的任务 id 列表\",\n            \"input_schema\": {\n                \"type\": \"object\",\n                \"properties\": {\n                    \"title\": { \"type\": \"string\" },\n                    \"deps\": { \"type\": \"array\", \"items\": { \"type\": \"string\" } }\n                },\n                \"required\": [\"title\", \"deps\"]\n            }\n        })\n    }\n    async fn execute(&self, input: Value) -> String {\n        let title = input[\"title\"].as_str().unwrap_or(\"\").to_string();\n        let deps: Vec<String> = input[\"deps\"].as_array().unwrap_or(&vec![])\n            .iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();\n        let mut mgr = self.0.lock().unwrap();\n        match mgr.add(&title, deps) {\n            Ok(id) => format!(\"已创建任务 id={} title={}\", id, title),\n            Err(e) => format!(\"创建失败: {}\", e),\n        }\n    }\n}\n\nstruct UpdateTaskTool(SharedManager);\n\n#[async_trait]\nimpl Tool for UpdateTaskTool {\n    fn name(&self) -> &str { \"udpate_task\" }\n    fn definition(&self) -> Value {\n        json!({\n            \"name\": \"update_task\",\n            \"description\": \"更新任务状态\",\n            \"input_schema\": {\n                \"type\": \"object\",\n                \"properties\": {\n                    \"id\": { \"type\": \"string\" },\n                    \"status\": { \"type\": \"string\", \"enum\": [\"todo\", \"in_progress\", \"done\"] }\n                },\n                \"required\": [\"id\", \"status\"]\n            }\n        })\n    }\n    async fn execute(&self, input: Value) -> String {\n        let id = input[\"id\"].as_str().unwrap_or(\"\");\n        let status = match input[\"status\"].as_str().unwrap_or(\"\") {\n            \"todo\" => TaskStatus::Todo,\n            \"in_progress\" => TaskStatus::InProgress,\n            \"done\" => TaskStatus::Done,\n            s => return format!(\"未知状态: {}\", s),\n        };\n        let mut mgr = self.0.lock().unwrap();\n        match mgr.update_status(id, status) {\n            Ok(()) => format!(\"任务 {} 状态已更新\", id),\n            Err(e) => format!(\"更新失败: {}\", e),\n        }\n    }\n}\n\nstruct ListTasksTool(SharedManager);\n\n#[async_trait]\nimpl Tool for ListTasksTool {\n    fn name(&self) -> &str { \"list_tasks\" }\n    fn definition(&self) -> Value {\n        json!({\n            \"name\": \"list_tasks\",\n            \"description\": \"列出所有任务 (按拓扑顺序)\",\n            \"input_schema\": { \"type\": \"object\", \"properties\": {} }\n        })\n    }\n    async fn execute(&self, _input: Value) -> String {\n        let mgr = self.0.lock().unwrap();\n        match mgr.topo_sort() {\n            Ok(tasks) => {\n                if tasks.is_empty() { return \"暂无任务\".to_string(); }\n                tasks.iter().map(|t| {\n                    let deps = if t.deps.is_empty() { \"无\".to_string() } else { t.deps.join(\", \") };\n                    format!(\"[{}] {} | 状态: {} | 依赖: {}\", t.id, t.title, t.status, deps)\n                }).collect::<Vec<_>>().join(\"\\n\")\n            }\n            Err(e) => format!(\"错误: {}\", e),\n        }\n    }\n}\n\nstruct GetNextTasksTool(SharedManager);\n\n#[async_trait]\nimpl Tool for GetNextTasksTool {\n    fn name(&self) -> &str { \"get_next_tasks\" }\n    fn definition(&self) -> Value {\n        json!({\n            \"name\": \"get_next_tasks\",\n            \"description\": \"返回所有依赖已完成、可立即开始的 todo 任务\",\n            \"input_schema\": { \"type\": \"object\", \"properties\": {} }\n        })\n    }\n    async fn execute(&self, _input: Value) -> String {\n        let mgr = self.0.lock().unwrap();\n        let next = mgr.get_next_tasks();\n        if next.is_empty() {\n            \"没有可立即执行的任务\".to_string()\n        } else {\n            next.iter().map(|t| format!(\"[{}] {}\", t.id, t.title)).collect::<Vec<_>>().join(\"\\n\")\n        }\n    }\n}\n\n// API 调用\n\nasync fn call_api(\n    client: &reqwest::Client,\n    api_key: &str,\n    messages: &[learn_claude_code_rust::Message],\n    tools: &[Value],\n    system: &str,\n) -> learn_claude_code_rust::ApiResponse {\n    let request = learn_claude_code_rust::ApiRequest {\n        model: \"claude-haiku-4-5\".to_string(),\n        max_tokens: 8096,\n        system: system.to_string(),\n        messages: messages.to_vec(),\n        tools: Some(tools.to_vec()),\n    };\n    client.post(\"https://api.ofox.ai/anthropic/v1/messages\")\n        .header(\"Authorization\", format!(\"Bearer {}\", api_key))\n        .header(\"anthropic-version\", \"2023-06-01\")\n        .header(\"content-type\", \"application/json\")\n        .json(&request)\n        .send().await.unwrap()\n        .json::<learn_claude_code_rust::ApiResponse>().await.unwrap()\n}\n\n\n// main\n\n#[tokio::main]\nasync fn main() {\n    let api_key = std::env::var(\"ANTHROPIC_API_KEY\").expect(\"ANTHROPIC_API_KEY not set\");\n    let client = reqwest::Client::new();\n\n    let manager = Arc::new(Mutex::new(TaskManager::load(\"tasks.json\")));\n\n    let mut tools: HashMap<String, Box<dyn Tool>> = HashMap::new();\n    tools.insert(\"create_task\".to_string(),     Box::new(CreateTaskTool(manager.clone())));\n    tools.insert(\"update_task\".to_string(),     Box::new(UpdateTaskTool(manager.clone())));\n    tools.insert(\"list_tasks\".to_string(),      Box::new(ListTasksTool(manager.clone())));\n    tools.insert(\"get_next_tasks\".to_string(),  Box::new(GetNextTasksTool(manager.clone())));\n\n    let tool_defs: Vec<Value> = tools.values().map(|t| t.definition()).collect();\n\n    let system = \"你是一个任务管理助手。用户描述项目后，用 create_task 创建任务并合并设置依赖，然后用 list_tasks 展示完整列表，最后用 get_next_tasks 告诉用户可以立即开始的任务。\";\n\n    println!(\"=== S07 Task System ===\");\n    println!(\"任务持久化到 tasks.json\\n\");\n\n    print!(\"> \");\n    IoWrite::flush(&mut stdout()).unwrap();\n    let mut input = String::new();\n    stdin().read_line(&mut input).unwrap();\n\n    let mut messages = vec![learn_claude_code_rust::Message {\n        role: \"user\".to_string(),\n        content: json!(input.trim()),\n    }];\n\n    loop {\n        let response = call_api(&client, &api_key, &messages, &tool_defs, system).await;\n\n        if response.stop_reason.as_deref() == Some(\"tool_use\") {\n            messages.push(learn_claude_code_rust::Message {\n                role: \"assistant\".to_string(),\n                content: json!(response.content),\n            });\n\n            let mut results = vec![];\n            for block in &response.content {\n                if let learn_claude_code_rust::ContentBlock::ToolUse { id, name, input } = block {\n                    println!(\"[工具] {}\", name);\n                    let result = tools[name].execute(input.clone()).await;\n                    println!(\"    -> {}\", result.lines().next().unwrap_or(\"\"));\n                    results.push(json!({\n                        \"type\": \"tool_result\",\n                        \"tool_use_id\": id,\n                        \"content\": result\n                    }));\n                }\n            }\n\n            messages.push(learn_claude_code_rust::Message {\n                role: \"user\".to_string(),\n                content: json!(results),\n            });\n        } else {\n            println!();\n            for block in &response.content {\n                if let learn_claude_code_rust::ContentBlock::Text { text } = block {\n                    println!(\"Claude: {}\", text);\n                }\n            }\n            break;\n        }\n    }\n}\n"
+    },
+    {
+      "id": "s08",
+      "filename": "s08_background_tasks.rs",
+      "title": "Background Tasks",
+      "subtitle": "Background Threads + Notifications",
+      "loc": 235,
+      "tools": [
+        "run_background",
+        "check_background",
+        "list_background"
+      ],
+      "newTools": [
+        "run_background",
+        "check_background",
+        "list_background"
+      ],
+      "coreAddition": "BackgroundManager + notification queue",
+      "keyInsight": "Run slow operations in the background; the agent keeps thinking ahead",
+      "classes": [
+        {
+          "name": "BgTask",
+          "startLine": 19,
+          "endLine": 22
+        },
+        {
+          "name": "RunBackgroundTool",
+          "startLine": 31,
+          "endLine": 34
+        },
+        {
+          "name": "CheckBackgroundTool",
+          "startLine": 102,
+          "endLine": 103
+        },
+        {
+          "name": "ListBackgroundTool",
+          "startLine": 139,
+          "endLine": 140
+        }
+      ],
+      "functions": [
+        {
+          "name": "call_api",
+          "signature": "async fn call_api(",
+          "startLine": 169
+        },
+        {
+          "name": "main",
+          "signature": "async fn main() {",
+          "startLine": 195
+        }
+      ],
+      "layer": "concurrency",
+      "source": "use async_trait::async_trait;\nuse learn_claude_code_rust::Tool;\nuse serde_json::{json, Value};\nuse std::collections::HashMap;\nuse std::io::{Write as IoWrite, stdin, stdout};\nuse std::sync::{Arc, Mutex};\nuse tokio::sync::mpsc;\n\n// ── 后台任务状态 ────────────────────────────────────────────────\n\n#[derive(Debug, Clone)]\nenum BgStatus {\n    Running,\n    Done(String),\n    Failed(String),\n}\n\n#[derive(Debug, Clone)]\nstruct BgTask {\n    id: String,\n    command: String,\n    status: BgStatus,\n}\n\ntype BgStore = Arc<Mutex<HashMap<String, BgTask>>>;\n// 完成通知: (task_id, output, is_error)\ntype CompletionTx = mpsc::UnboundedSender<(String, String, bool)>;\n\n// ── run_background 工具 ─────────────────────────────────────────\n\nstruct RunBackgroundTool {\n    store: BgStore,\n    tx: CompletionTx,\n    next_id: Arc<Mutex<u32>>,\n}\n\n#[async_trait]\nimpl Tool for RunBackgroundTool {\n    fn name(&self) -> &str { \"run_background\" }\n    fn definition(&self) -> Value {\n        json!({\n            \"name\": \"run_background\",\n            \"description\": \"在后台异步执行 shell 命令，立即返回任务 id，不阻塞 agent\",\n            \"input_schema\": {\n                \"type\": \"object\",\n                \"properties\": {\n                    \"command\": { \"type\": \"string\" }\n                },\n                \"required\": [\"command\"]\n            }\n        })\n    }\n    async fn execute(&self, input: Value) -> String {\n        let command = input[\"command\"].as_str().unwrap_or(\"\").to_string();\n\n        let id = {\n            let mut n = self.next_id.lock().unwrap();\n            let id = format!(\"bg-{}\", n);\n            *n += 1;\n            id\n        };\n\n        // 注册为 Running\n        self.store.lock().unwrap().insert(id.clone(), BgTask {\n            id: id.clone(),\n            command: command.clone(),\n            status: BgStatus::Running,\n        });\n\n        // tokio::spawn：后台跑，主线程立即返回\n        let store = self.store.clone();\n        let tx = self.tx.clone();\n        let id2 = id.clone();\n        tokio::spawn(async move {\n            let out = tokio::process::Command::new(\"sh\")\n                .arg(\"-c\").arg(&command)\n                .output().await;\n\n            let (result, is_error) = match out {\n                Ok(o) if o.status.success() =>\n                    (String::from_utf8_lossy(&o.stdout).into_owned(), false),\n                Ok(o) =>\n                    (String::from_utf8_lossy(&o.stderr).into_owned(), true),\n                Err(e) => (e.to_string(), true),\n            };\n\n            let status = if is_error {\n                BgStatus::Failed(result.clone())\n            } else {\n                BgStatus::Done(result.clone())\n            };\n            store.lock().unwrap().entry(id2.clone()).and_modify(|t| t.status = status);\n            let _ = tx.send((id2, result, is_error));\n        });\n\n        format!(\"后台任务已启动，id={}\", id)\n    }\n}\n\n// ── check_background 工具 ───────────────────────────────────────\n\nstruct CheckBackgroundTool(BgStore);\n\n#[async_trait]\nimpl Tool for CheckBackgroundTool {\n    fn name(&self) -> &str { \"check_background\" }\n    fn definition(&self) -> Value {\n        json!({\n            \"name\": \"check_background\",\n            \"description\": \"查看某个后台任务的状态和输出\",\n            \"input_schema\": {\n                \"type\": \"object\",\n                \"properties\": {\n                    \"id\": { \"type\": \"string\" }\n                },\n                \"required\": [\"id\"]\n            }\n        })\n    }\n    async fn execute(&self, input: Value) -> String {\n        let id = input[\"id\"].as_str().unwrap_or(\"\");\n        let store = self.0.lock().unwrap();\n        match store.get(id) {\n            None => format!(\"找不到任务 {}\", id),\n            Some(t) => match &t.status {\n                BgStatus::Running =>\n                    format!(\"[{}] {} | 运行中...\", id, t.command),\n                BgStatus::Done(out) =>\n                    format!(\"[{}] {} | 完成\\n{}\", id, t.command, out),\n                BgStatus::Failed(err) =>\n                    format!(\"[{}] {} | 失败\\n{}\", id, t.command, err),\n            }\n        }\n    }\n}\n\n// ── list_background 工具 ────────────────────────────────────────\n\nstruct ListBackgroundTool(BgStore);\n\n#[async_trait]\nimpl Tool for ListBackgroundTool {\n    fn name(&self) -> &str { \"list_background\" }\n    fn definition(&self) -> Value {\n        json!({\n            \"name\": \"list_background\",\n            \"description\": \"列出所有后台任务及当前状态\",\n            \"input_schema\": { \"type\": \"object\", \"properties\": {} }\n        })\n    }\n    async fn execute(&self, _input: Value) -> String {\n        let store = self.0.lock().unwrap();\n        if store.is_empty() { return \"暂无后台任务\".to_string(); }\n        let mut lines: Vec<String> = store.values().map(|t| {\n            let s = match &t.status {\n                BgStatus::Running   => \"运行中\",\n                BgStatus::Done(_)   => \"完成\",\n                BgStatus::Failed(_) => \"失败\",\n            };\n            format!(\"[{}] {} | {}\", t.id, t.command, s)\n        }).collect();\n        lines.sort();\n        lines.join(\"\\n\")\n    }\n}\n\n// ── API ─────────────────────────────────────────────────────────\n\nasync fn call_api(\n    client: &reqwest::Client,\n    api_key: &str,\n    messages: &[learn_claude_code_rust::Message],\n    tools: &[Value],\n    system: &str,\n) -> learn_claude_code_rust::ApiResponse {\n    let req = learn_claude_code_rust::ApiRequest {\n        model: \"claude-haiku-4-5-20251001\".to_string(),\n        max_tokens: 8096,\n        system: system.to_string(),\n        messages: messages.to_vec(),\n        tools: Some(tools.to_vec()),\n    };\n    client.post(\"https://api.ofox.ai/anthropic/v1/messages\")\n        .header(\"Authorization\", format!(\"Bearer {}\", api_key))\n        .header(\"anthropic-version\", \"2023-06-01\")\n        .header(\"content-type\", \"application/json\")\n        .json(&req)\n        .send().await.unwrap()\n        .json::<learn_claude_code_rust::ApiResponse>().await.unwrap()\n}\n\n// ── main ────────────────────────────────────────────────────────\n\n#[tokio::main]\nasync fn main() {\n    let api_key = std::env::var(\"ANTHROPIC_API_KEY\").expect(\"ANTHROPIC_API_KEY not set\");\n    let client = reqwest::Client::new();\n\n    let store: BgStore = Arc::new(Mutex::new(HashMap::new()));\n    let (tx, mut rx) = mpsc::unbounded_channel::<(String, String, bool)>();\n    let next_id = Arc::new(Mutex::new(1u32));\n\n    let mut tools: HashMap<String, Box<dyn Tool>> = HashMap::new();\n    tools.insert(\"run_background\".to_string(), Box::new(RunBackgroundTool {\n        store: store.clone(), tx, next_id,\n    }));\n    tools.insert(\"check_background\".to_string(), Box::new(CheckBackgroundTool(store.clone())));\n    tools.insert(\"list_background\".to_string(),  Box::new(ListBackgroundTool(store.clone())));\n\n    let tool_defs: Vec<Value> = tools.values().map(|t| t.definition()).collect();\n    let system = \"你是支持后台任务的 agent。用 run_background 启动耗时命令并告知用户任务 id；可继续对话；用 check_background 或 list_background 查询进度。\";\n\n    println!(\"=== S08 Background Tasks ===\");\n    println!(\"输入 exit 退出\\n\");\n\n    let mut messages: Vec<learn_claude_code_rust::Message> = vec![];\n\n    loop {\n        // 非阻塞：打印所有已完成的后台通知\n        while let Ok((id, out, err)) = rx.try_recv() {\n            let label = if err { \"失败\" } else { \"完成\" };\n            println!(\"\\n[后台通知] {} {} | {}\",\n                id, label, out.lines().next().unwrap_or(\"\"));\n        }\n\n        print!(\"> \");\n        IoWrite::flush(&mut stdout()).unwrap();\n        let mut line = String::new();\n        stdin().read_line(&mut line).unwrap();\n        let line = line.trim().to_string();\n        if line.is_empty() { continue; }\n        if line == \"exit\" || line == \"quit\" { break; }\n\n        messages.push(learn_claude_code_rust::Message {\n            role: \"user\".to_string(),\n            content: json!(line),\n        });\n\n        // agent loop（工具调用直到 end_turn）\n        loop {\n            let resp = call_api(&client, &api_key, &messages, &tool_defs, system).await;\n\n            if resp.stop_reason.as_deref() == Some(\"tool_use\") {\n                messages.push(learn_claude_code_rust::Message {\n                    role: \"assistant\".to_string(),\n                    content: json!(resp.content),\n                });\n                let mut results = vec![];\n                for block in &resp.content {\n                    if let learn_claude_code_rust::ContentBlock::ToolUse { id, name, input } = block {\n                        println!(\"[工具] {}\", name);\n                        let result = match tools.get(name.as_str()) {\n                            Some(t) => t.execute(input.clone()).await,\n                            None => format!(\"未知工具: {}\", name),\n                        };\n                        println!(\"    -> {}\", result.lines().next().unwrap_or(\"\"));\n                        results.push(json!({\n                            \"type\": \"tool_result\",\n                            \"tool_use_id\": id,\n                            \"content\": result\n                        }));\n                    }\n                }\n                messages.push(learn_claude_code_rust::Message {\n                    role: \"user\".to_string(),\n                    content: json!(results),\n                });\n            } else {\n                println!();\n                for block in &resp.content {\n                    if let learn_claude_code_rust::ContentBlock::Text { text } = block {\n                        println!(\"Claude: {}\", text);\n                    }\n                }\n                break;\n            }\n        }\n    }\n}\n"
+    },
+    {
+      "id": "s09",
+      "filename": "s09_agent_teams.rs",
+      "title": "Agent Teams",
+      "subtitle": "Teammates + Mailboxes",
+      "loc": 216,
+      "tools": [
+        "bash",
+        "send_message"
+      ],
+      "newTools": [
+        "bash",
+        "send_message"
+      ],
+      "coreAddition": "TeammateManager + file-based mailbox",
+      "keyInsight": "When one agent can't finish, delegate to persistent teammates via async mailboxes",
+      "classes": [
+        {
+          "name": "Teammate",
+          "startLine": 10,
+          "endLine": 13
+        },
+        {
+          "name": "BashTool",
+          "startLine": 18,
+          "endLine": 18
+        },
+        {
+          "name": "SendMessageTool",
+          "startLine": 99,
+          "endLine": 103
+        }
+      ],
+      "functions": [
+        {
+          "name": "teammate_loop",
+          "signature": "async fn teammate_loop(",
+          "startLine": 46
+        },
+        {
+          "name": "main",
+          "signature": "async fn main() {",
+          "startLine": 163
+        },
+        {
+          "name": "call_api",
+          "signature": "async fn call_api(",
+          "startLine": 243
+        }
+      ],
+      "layer": "collaboration",
+      "source": "use async_trait::async_trait;\nuse learn_claude_code_rust::{ContentBlock, Message, Tool};\nuse serde_json::{json, Value};\nuse std::collections::HashMap;\nuse std::io::{Write as IoWrite, stdin, stdout};\nuse std::sync::Arc;\n\n// --- Teammate 定义 ---\n\nstruct Teammate {\n    name: String,\n    role: String,\n    system_prompt: String,\n}\n\n// --- 基础工具 (供 teammate 使用) ---\n\nstruct BashTool;\n#[async_trait]\nimpl Tool for BashTool {\n    fn name(&self) -> &str { \"bash\" }\n    fn definition(&self) -> Value {\n        json!({\n            \"name\": \"bash\",\n            \"description\": \"执行 bash 命令\",\n            \"input_schema\": {\n                \"type\": \"object\",\n                \"properties\": { \"command\": { \"type\": \"string\" } },\n                \"required\": [\"command\"]\n            }\n        })\n    }\n    async fn execute(&self, input: Value) -> String {\n        let out = std::process::Command::new(\"sh\")\n            .arg(\"-c\").arg(input[\"command\"].as_str().unwrap_or(\"\"))\n            .output().expect(\"failed\");\n        String::from_utf8_lossy(&out.stdout).to_string()\n            + &String::from_utf8_lossy(&out.stderr)\n    }\n}\n\n// --- teammate 的 agent_loop ---\n// 与 s04 的 agent_loop 一致，区别是接收 system_prompt 感受\n// messages 是局部变量，完全隔离\n\nasync fn teammate_loop(\n    client: &reqwest::Client,\n    api_key: &str,\n    system_prompt: &str,\n    task: &str,\n    tools: &HashMap<String, Box<dyn Tool>>,\n    tool_defs: &[Value],\n) -> String {\n    let mut messages = vec![Message {\n        role: \"user\".to_string(),\n        content: json!(task),\n    }];\n\n    loop {\n        let response = call_api(client, api_key, &messages, tool_defs, system_prompt).await;\n\n        if response.stop_reason.as_deref() == Some(\"tool_use\") {\n            messages.push(Message {\n                role: \"assistant\".to_string(),\n                content: json!(response.content),\n            });\n\n            let mut results = vec![];\n            for block in &response.content {\n                if let ContentBlock::ToolUse { id, name, input } = block {\n                    println!(\"  [teammate 工具] {}\", name);\n                    let result = tools[name].execute(input.clone()).await;\n                    results.push(json!({\n                        \"type\": \"tool_result\",\n                        \"tool_use_id\": id,\n                        \"content\": result\n                    }));\n                }\n            }\n\n            messages.push(Message {\n                role: \"user\".to_string(),\n                content: json!(results),\n            });\n        } else {\n            return response.content.iter()\n                .filter_map(|b| if let ContentBlock::Text { text } = b { Some(text.clone()) } else { None })\n                .collect::<Vec<_>>()\n                .join(\"\\n\");\n        }\n    }\n}\n\n\n// --- SendMessageTool ---\n// 主 agent 用这个 tool 把任务发给指定的 teammate\n// teammate 有自己的 role (system_prompt), 完全独立运行\n\nstruct SendMessageTool {\n    client: Arc<reqwest::Client>,\n    api_key: Arc<String>,\n    // 用 Arc 共享 teammate 注册表\n    teammates: Arc<HashMap<String, Teammate>>,\n}\n\n#[async_trait]\nimpl Tool for SendMessageTool {\n    fn name(&self) -> &str { \"send_message\" }\n\n    fn definition(&self) -> Value {\n        json!({\n            \"name\": \"send_message\",\n            \"description\": \"把任务发给指定的队友(teammate)。队友有自己的专长，会独立完成任务并返回结果。可用队友: coder(代码生成), reviewer(代码审查)\",\n            \"input_schema\": {\n                \"type\": \"object\",\n                \"properties\": {\n                    \"to\": {\n                        \"type\": \"string\",\n                        \"description\": \"队友名字: coder 或 reviewer\"\n                    },\n                    \"message\": {\n                        \"type\": \"string\",\n                        \"description\": \"交给队友的任务描述\"\n                    }\n                },\n                \"required\": [\"to\", \"message\"]\n            }\n        })\n    }\n\n    async fn execute(&self, input: Value) -> String {\n        let to = input[\"to\"].as_str().unwrap_or(\"\");\n        let message = input[\"message\"].as_str().unwrap_or(\"\");\n\n        let Some(teammate) = self.teammates.get(to) else {\n            return format!(\"未找到队友: {}\", to);\n        };\n\n        println!(\"[主agent -> {}({})] {}\", teammate.name, teammate.role, message);\n\n        // teammate 的工具集 (根据角色可以不同，这里都给 bash)\n        let mut tools: HashMap<String, Box<dyn Tool>> = HashMap::new();\n        tools.insert(\"bash\".to_string(), Box::new(BashTool));\n        let tool_defs: Vec<Value> = tools.values().map(|t| t.definition()).collect();\n\n        let result = teammate_loop(\n            &self.client,\n            &self.api_key,\n            &teammate.system_prompt,\n            message,\n            &tools,\n            &tool_defs,\n        ).await;\n\n        println!(\"[{} -> 主agent] 完成\", teammate.name);\n        result\n    }\n}\n\n// --- main ---\n\n#[tokio::main]\nasync fn main() {\n    let api_key = Arc::new(std::env::var(\"ANTHROPIC_API_KEY\").expect(\"需要 ANTHROPIC_API_KEY\"));\n    let client = Arc::new(reqwest::Client::new());\n\n    // 注册 teammates\n    let mut teammate_map = HashMap::new();\n    teammate_map.insert(\"coder\".to_string(), Teammate {\n        name: \"coder\".to_string(),\n        role: \"代码生成专家\".to_string(),\n        system_prompt: \"你是一个 Rust 代码生成专家。收到需求后，直接给出简洁、正确的 Rust代码实现，并简要说明思路。\".to_string(),\n    });\n    teammate_map.insert(\"reviewer\".to_string(), Teammate {\n        name: \"reviewer\".to_string(),\n        role: \"代码审查专家\".to_string(),\n        system_prompt: \"你是一个严格的代码审查专家。收到代码后，找出潜在的 bug、性能问题、不符合 Rust 惯用法的写法，给出具体的改进建议。\".to_string(),\n    });\n\n    let teammates = Arc::new(teammate_map);\n\n    // 主 agent 只有 send_message 工具\n    let mut tools: HashMap<String, Box<dyn Tool>> = HashMap::new();\n    tools.insert(\"send_message\".to_string(), Box::new(SendMessageTool {\n        client: client.clone(),\n        api_key: api_key.clone(),\n        teammates: teammates.clone(),\n    }));\n    let tool_defs: Vec<Value> = tools.values().map(|t| t.definition()).collect();\n\n    let system = \"你是一个技术团队的协调者。你有两个队友：\\\n        - coder: 负责写代码\\\n        - reviewer: 负责审核代码\\\n        收到任务后，先让 coder 实现，再把代码发给 reviewer 审查，最后综合两人的结果给出完整回答。\";\n\n    print!(\"任务> \");\n    IoWrite::flush(&mut stdout()).unwrap();\n    let mut input = String::new();\n    stdin().read_line(&mut input).unwrap();\n\n    let mut messages = vec![Message {\n        role: \"user\".to_string(),\n        content: json!(input.trim()),\n    }];\n\n    loop {\n        let response = call_api(&client, &api_key, &messages, &tool_defs, system).await;\n\n        if response.stop_reason.as_deref() == Some(\"tool_use\") {\n            messages.push(Message {\n                role: \"assistant\".to_string(),\n                content: json!(response.content),\n            });\n\n            let mut results = vec![];\n            for block in &response.content {\n                if let ContentBlock::ToolUse { id, name, input } = block {\n                    println!(\"[主agent 调用工具] {}\", name);\n                    let result = tools[name].execute(input.clone()).await;\n                    results.push(json!({\n                        \"type\": \"tool_result\",\n                        \"tool_use_id\": id,\n                        \"content\": result\n                    }));\n                }\n            }\n\n            messages.push(Message {\n                role: \"user\".to_string(),\n                content: json!(results),\n            });\n        } else {\n            for block in &response.content {\n                if let ContentBlock::Text { text } = block {\n                    println!(\"\\nClaude: {}\", text);\n                }\n            }\n            break;\n        }\n    }\n}\n\nasync fn call_api(\n    client: &reqwest::Client,\n    api_key: &str,\n    messages: &[Message],\n    tools: &[Value],\n    system: &str,\n) -> learn_claude_code_rust::ApiResponse {\n    let request = learn_claude_code_rust::ApiRequest {\n        model: \"claude-haiku-4-5\".to_string(),\n        max_tokens: 8096,\n        system: system.to_string(),\n        messages: messages.to_vec(),\n        tools: Some(tools.to_vec()),\n    };\n    client.post(\"https://api.ofox.ai/anthropic/v1/messages\")\n        .header(\"Authorization\", format!(\"Bearer {}\", api_key))\n        .header(\"anthropic-version\", \"2023-06-01\")\n        .header(\"content-type\", \"application/json\")\n        .json(&request).send().await.unwrap()\n        .json::<learn_claude_code_rust::ApiResponse>().await.unwrap()\n}\n"
+    },
+    {
+      "id": "s10",
+      "filename": "s10_protocols.rs",
+      "title": "Team Protocols",
+      "subtitle": "Shared Communication Rules",
+      "loc": 356,
+      "tools": [
+        "bash",
+        "shutdown",
+        "request_plan_approval",
+        "send_message"
+      ],
+      "newTools": [
+        "shutdown",
+        "request_plan_approval"
+      ],
+      "coreAddition": "request_id correlation for two protocols",
+      "keyInsight": "One request-response pattern drives all team negotiation",
+      "classes": [
+        {
+          "name": "Teammate",
+          "startLine": 113,
+          "endLine": 114
+        },
+        {
+          "name": "BashTool",
+          "startLine": 119,
+          "endLine": 119
+        },
+        {
+          "name": "ShutdownTool",
+          "startLine": 145,
+          "endLine": 147
+        },
+        {
+          "name": "PlanRequestTool",
+          "startLine": 175,
+          "endLine": 176
+        },
+        {
+          "name": "SendMessageTool",
+          "startLine": 228,
+          "endLine": 231
+        }
+      ],
+      "functions": [
+        {
+          "name": "teammate_loop",
+          "signature": "async fn teammate_loop(",
+          "startLine": 289
+        },
+        {
+          "name": "main",
+          "signature": "async fn main() {",
+          "startLine": 324
+        },
+        {
+          "name": "call_api",
+          "signature": "async fn call_api(",
+          "startLine": 433
+        }
+      ],
+      "layer": "collaboration",
+      "source": "// S10 Protocols — 统一消息格式 + 协议状态机\n//\n// 核心概念：\n//   - AgentMessage enum：所有 agent 间通信的统一格式\n//   - Protocol enum：agent 的当前协议状态（空闲/等待批准/关闭中）\n//   - 主 agent 收到 shutdown 信号后走关闭流程\n//   - 主 agent 生成 plan 后先请求用户批准，批准后才执行\n//\n// Rust 重点：enum 状态机、match 穷尽模式、Display trait\n\nuse async_trait::async_trait;\nuse learn_claude_code_rust::{ContentBlock, Message, Tool};\nuse serde::{Deserialize, Serialize};\nuse serde_json::{json, Value};\nuse std::collections::HashMap;\nuse std::io::{Write as IoWrite, stdin, stdout};\nuse std::sync::Arc;\n\n// ── 统一消息格式 ──────────────────────────────────────────────────────────────\n\n/// 所有在 agent 之间传递的消息都用这个 enum 表示\n/// tag = \"type\" 让序列化后带上 type 字段，方便调试\n#[derive(Debug, Clone, Serialize, Deserialize)]\n#[serde(tag = \"type\", rename_all = \"snake_case\")]\nenum AgentMessage {\n    /// 普通任务请求\n    Task { from: String, to: String, content: String },\n    /// 任务完成后的响应\n    Result { from: String, to: String, content: String },\n    /// 要求执行前先经过审批的计划\n    PlanRequest { from: String, plan: String },\n    /// 用户批准 / 拒绝计划\n    PlanApproval { approved: bool, reason: Option<String> },\n    /// 触发关闭流程\n    Shutdown { reason: String },\n}\n\nimpl std::fmt::Display for AgentMessage {\n    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        match self {\n            AgentMessage::Task { from, to, content } =>\n                write!(f, \"[Task] {} -> {}: {}\", from, to, content),\n            AgentMessage::Result { from, to, content } =>\n                write!(f, \"[Result] {} -> {}: {}\", from, to, content),\n            AgentMessage::PlanRequest { from, plan } =>\n                write!(f, \"[PlanRequest] from={} plan={}\", from, plan),\n            AgentMessage::PlanApproval { approved, reason } =>\n                write!(f, \"[PlanApproval] approved={} reason={:?}\", approved, reason),\n            AgentMessage::Shutdown { reason } =>\n                write!(f, \"[Shutdown] reason={}\", reason),\n        }\n    }\n}\n\n// ── 协议状态机 ────────────────────────────────────────────────────────────────\n\n/// 描述 agent 当前所处的协议阶段\n#[derive(Debug, Clone, PartialEq)]\nenum Protocol {\n    /// 正常运行，等待用户输入\n    Idle,\n    /// 已发出 PlanRequest，等待用户审批\n    AwaitingApproval { plan: String },\n    /// 收到 Shutdown，正在清理\n    ShuttingDown { reason: String },\n    /// 完全终止\n    Terminated,\n}\n\nimpl std::fmt::Display for Protocol {\n    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        match self {\n            Protocol::Idle => write!(f, \"Idle\"),\n            Protocol::AwaitingApproval { .. } => write!(f, \"AwaitingApproval\"),\n            Protocol::ShuttingDown { reason } => write!(f, \"ShuttingDown({})\", reason),\n            Protocol::Terminated => write!(f, \"Terminated\"),\n        }\n    }\n}\n\nimpl Protocol {\n    /// 状态转换：接收一条消息后返回新状态\n    fn transition(self, msg: &AgentMessage) -> Self {\n        match (self, msg) {\n            // 空闲时收到计划请求 → 等待审批\n            (Protocol::Idle, AgentMessage::PlanRequest { plan, .. }) =>\n                Protocol::AwaitingApproval { plan: plan.clone() },\n\n            // 等待审批时收到批准 → 回到空闲（执行计划由调用方负责）\n            (Protocol::AwaitingApproval { .. }, AgentMessage::PlanApproval { approved: true, .. }) =>\n                Protocol::Idle,\n\n            // 等待审批时收到拒绝 → 回到空闲（放弃计划）\n            (Protocol::AwaitingApproval { .. }, AgentMessage::PlanApproval { approved: false, .. }) =>\n                Protocol::Idle,\n\n            // 任意状态收到 Shutdown → 进入关闭流程\n            (_, AgentMessage::Shutdown { reason }) =>\n                Protocol::ShuttingDown { reason: reason.clone() },\n\n            // ShuttingDown 完成清理后 → Terminated（由外部触发，这里用 Task 消息模拟）\n            (Protocol::ShuttingDown { .. }, AgentMessage::Task { .. }) =>\n                Protocol::Terminated,\n\n            // 其他情况保持不变\n            (state, _) => state,\n        }\n    }\n}\n\n// ── Teammate ──────────────────────────────────────────────────────────────────\n\nstruct Teammate {\n    system_prompt: String,\n}\n\n// ── 工具 ──────────────────────────────────────────────────────────────────────\n\nstruct BashTool;\n#[async_trait]\nimpl Tool for BashTool {\n    fn name(&self) -> &str { \"bash\" }\n    fn definition(&self) -> Value {\n        json!({\n            \"name\": \"bash\",\n            \"description\": \"执行 bash 命令\",\n            \"input_schema\": {\n                \"type\": \"object\",\n                \"properties\": { \"command\": { \"type\": \"string\" } },\n                \"required\": [\"command\"]\n            }\n        })\n    }\n    async fn execute(&self, input: Value) -> String {\n        let out = std::process::Command::new(\"sh\")\n            .arg(\"-c\").arg(input[\"command\"].as_str().unwrap_or(\"\"))\n            .output().expect(\"failed\");\n        String::from_utf8_lossy(&out.stdout).to_string()\n            + &String::from_utf8_lossy(&out.stderr)\n    }\n}\n\n/// 主 agent 用来触发关闭流程的工具\n/// Claude 调用 shutdown 时，外部循环检测到协议状态变为 ShuttingDown\nstruct ShutdownTool {\n    // 用 Arc<Mutex> 把状态写回主循环\n    protocol: Arc<std::sync::Mutex<Protocol>>,\n}\n#[async_trait]\nimpl Tool for ShutdownTool {\n    fn name(&self) -> &str { \"shutdown\" }\n    fn definition(&self) -> Value {\n        json!({\n            \"name\": \"shutdown\",\n            \"description\": \"发起关闭流程。当用户说'退出'、'关闭'或任务全部完成时调用。\",\n            \"input_schema\": {\n                \"type\": \"object\",\n                \"properties\": {\n                    \"reason\": { \"type\": \"string\", \"description\": \"关闭原因\" }\n                },\n                \"required\": [\"reason\"]\n            }\n        })\n    }\n    async fn execute(&self, input: Value) -> String {\n        let reason = input[\"reason\"].as_str().unwrap_or(\"用户请求\").to_string();\n        let msg = AgentMessage::Shutdown { reason: reason.clone() };\n        let mut p = self.protocol.lock().unwrap();\n        *p = p.clone().transition(&msg);\n        format!(\"已发起关闭流程: {}\", reason)\n    }\n}\n\n/// 主 agent 用来提交计划、等待用户审批的工具\nstruct PlanRequestTool {\n    protocol: Arc<std::sync::Mutex<Protocol>>,\n}\n#[async_trait]\nimpl Tool for PlanRequestTool {\n    fn name(&self) -> &str { \"request_plan_approval\" }\n    fn definition(&self) -> Value {\n        json!({\n            \"name\": \"request_plan_approval\",\n            \"description\": \"提交执行计划，等待用户审批后再继续。对于有副作用的操作（写文件、执行命令）必须先调用此工具。\",\n            \"input_schema\": {\n                \"type\": \"object\",\n                \"properties\": {\n                    \"plan\": { \"type\": \"string\", \"description\": \"详细的执行步骤描述\" }\n                },\n                \"required\": [\"plan\"]\n            }\n        })\n    }\n    async fn execute(&self, input: Value) -> String {\n        let plan = input[\"plan\"].as_str().unwrap_or(\"\").to_string();\n        let msg = AgentMessage::PlanRequest { from: \"agent\".to_string(), plan: plan.clone() };\n        {\n            let mut p = self.protocol.lock().unwrap();\n            *p = p.clone().transition(&msg);\n        }\n        // 打印计划，让外部主循环读取用户输入并决定是否批准\n        println!(\"\\n[计划审批] Agent 提交了以下计划:\\n{}\\n\", plan);\n        print!(\"是否批准？(y/n): \");\n        IoWrite::flush(&mut stdout()).unwrap();\n\n        let mut answer = String::new();\n        stdin().read_line(&mut answer).unwrap();\n        let approved = answer.trim().to_lowercase().starts_with('y');\n\n        let approval = AgentMessage::PlanApproval {\n            approved,\n            reason: if approved { None } else { Some(\"用户拒绝\".to_string()) },\n        };\n        {\n            let mut p = self.protocol.lock().unwrap();\n            *p = p.clone().transition(&approval);\n        }\n\n        if approved {\n            \"计划已批准，继续执行。\".to_string()\n        } else {\n            \"计划被拒绝，请重新规划。\".to_string()\n        }\n    }\n}\n\n/// 派发给 teammate 的工具（复用 s09 模式）\nstruct SendMessageTool {\n    client: Arc<reqwest::Client>,\n    api_key: Arc<String>,\n    teammates: Arc<HashMap<String, Teammate>>,\n}\n#[async_trait]\nimpl Tool for SendMessageTool {\n    fn name(&self) -> &str { \"send_message\" }\n    fn definition(&self) -> Value {\n        json!({\n            \"name\": \"send_message\",\n            \"description\": \"把任务发给指定队友。可用: coder(写代码), reviewer(审查代码)\",\n            \"input_schema\": {\n                \"type\": \"object\",\n                \"properties\": {\n                    \"to\": { \"type\": \"string\" },\n                    \"message\": { \"type\": \"string\" }\n                },\n                \"required\": [\"to\", \"message\"]\n            }\n        })\n    }\n    async fn execute(&self, input: Value) -> String {\n        let to = input[\"to\"].as_str().unwrap_or(\"\");\n        let message = input[\"message\"].as_str().unwrap_or(\"\");\n\n        let Some(teammate) = self.teammates.get(to) else {\n            return format!(\"未找到队友: {}\", to);\n        };\n\n        // 构造 AgentMessage::Task 并打印（体现统一协议）\n        let msg = AgentMessage::Task {\n            from: \"coordinator\".to_string(),\n            to: to.to_string(),\n            content: message.to_string(),\n        };\n        println!(\"  {}\", msg);\n\n        let mut tools: HashMap<String, Box<dyn Tool>> = HashMap::new();\n        tools.insert(\"bash\".to_string(), Box::new(BashTool));\n        let tool_defs: Vec<Value> = tools.values().map(|t| t.definition()).collect();\n\n        let result = teammate_loop(\n            &self.client, &self.api_key,\n            &teammate.system_prompt, message,\n            &tools, &tool_defs,\n        ).await;\n\n        // 构造 AgentMessage::Result 并打印\n        let reply = AgentMessage::Result {\n            from: to.to_string(),\n            to: \"coordinator\".to_string(),\n            content: result.clone(),\n        };\n        println!(\"  {}\", reply);\n        result\n    }\n}\n\n// ── teammate agent loop ───────────────────────────────────────────────────────\n\nasync fn teammate_loop(\n    client: &reqwest::Client,\n    api_key: &str,\n    system_prompt: &str,\n    task: &str,\n    tools: &HashMap<String, Box<dyn Tool>>,\n    tool_defs: &[Value],\n) -> String {\n    let mut messages = vec![Message {\n        role: \"user\".to_string(),\n        content: json!(task),\n    }];\n    loop {\n        let response = call_api(client, api_key, &messages, tool_defs, system_prompt).await;\n        if response.stop_reason.as_deref() == Some(\"tool_use\") {\n            messages.push(Message { role: \"assistant\".to_string(), content: json!(response.content) });\n            let mut results = vec![];\n            for block in &response.content {\n                if let ContentBlock::ToolUse { id, name, input } = block {\n                    let result = tools[name].execute(input.clone()).await;\n                    results.push(json!({ \"type\": \"tool_result\", \"tool_use_id\": id, \"content\": result }));\n                }\n            }\n            messages.push(Message { role: \"user\".to_string(), content: json!(results) });\n        } else {\n            return response.content.iter()\n                .filter_map(|b| if let ContentBlock::Text { text } = b { Some(text.clone()) } else { None })\n                .collect::<Vec<_>>().join(\"\\n\");\n        }\n    }\n}\n\n// ── main ──────────────────────────────────────────────────────────────────────\n\n#[tokio::main]\nasync fn main() {\n    let api_key = Arc::new(std::env::var(\"ANTHROPIC_API_KEY\").expect(\"需要 ANTHROPIC_API_KEY\"));\n    let client = Arc::new(reqwest::Client::new());\n\n    // 协议状态机（共享给工具）\n    let protocol = Arc::new(std::sync::Mutex::new(Protocol::Idle));\n\n    // 注册 teammates\n    let mut teammate_map = HashMap::new();\n    teammate_map.insert(\"coder\".to_string(), Teammate {\n        system_prompt: \"你是 Rust 代码生成专家。收到需求后直接给出简洁正确的实现。\".to_string(),\n    });\n    teammate_map.insert(\"reviewer\".to_string(), Teammate {\n        system_prompt: \"你是严格的代码审查专家。找出 bug、性能问题和不符合 Rust 惯用法的写法。\".to_string(),\n    });\n    let teammates = Arc::new(teammate_map);\n\n    // 注册工具\n    let mut tools: HashMap<String, Box<dyn Tool>> = HashMap::new();\n    tools.insert(\"send_message\".to_string(), Box::new(SendMessageTool {\n        client: client.clone(), api_key: api_key.clone(), teammates: teammates.clone(),\n    }));\n    tools.insert(\"shutdown\".to_string(), Box::new(ShutdownTool {\n        protocol: protocol.clone(),\n    }));\n    tools.insert(\"request_plan_approval\".to_string(), Box::new(PlanRequestTool {\n        protocol: protocol.clone(),\n    }));\n    let tool_defs: Vec<Value> = tools.values().map(|t| t.definition()).collect();\n\n    let system = \"你是一个协调型 AI 技术团队。\\\n        - 对有副作用的操作，先用 request_plan_approval 列出执行计划并等待批准\\\n        - 批准后才派发给 coder / reviewer\\\n        - 用户说退出或任务全部完成时，调用 shutdown\\\n        始终用统一消息格式与队友沟通。\";\n\n    println!(\"=== S10 Protocols (输入 '退出' 触发关闭) ===\");\n\n    let mut messages: Vec<Message> = vec![];\n\n    loop {\n        // 检查协议状态\n        let current_state = protocol.lock().unwrap().clone();\n        match current_state {\n            Protocol::Terminated => {\n                println!(\"[协议] Agent 已终止。再见！\");\n                break;\n            }\n            Protocol::ShuttingDown { ref reason } => {\n                println!(\"[协议] 正在关闭: {}... 再见！\", reason);\n                // 转为 Terminated\n                let mut p = protocol.lock().unwrap();\n                *p = Protocol::Terminated;\n                break;\n            }\n            _ => {}\n        }\n\n        // 读取用户输入\n        print!(\"\\n用户> \");\n        IoWrite::flush(&mut stdout()).unwrap();\n        let mut input = String::new();\n        stdin().read_line(&mut input).unwrap();\n        let input = input.trim();\n        if input.is_empty() { continue; }\n\n        // 将用户输入包装成 AgentMessage::Task 并打印（体现统一协议）\n        let user_msg = AgentMessage::Task {\n            from: \"user\".to_string(),\n            to: \"coordinator\".to_string(),\n            content: input.to_string(),\n        };\n        println!(\"  {}\", user_msg);\n\n        messages.push(Message { role: \"user\".to_string(), content: json!(input) });\n\n        // agent loop（单轮完整推理直到 end_turn）\n        loop {\n            let response = call_api(&client, &api_key, &messages, &tool_defs, system).await;\n\n            if response.stop_reason.as_deref() == Some(\"tool_use\") {\n                messages.push(Message { role: \"assistant\".to_string(), content: json!(response.content) });\n                let mut results = vec![];\n                for block in &response.content {\n                    if let ContentBlock::ToolUse { id, name, input } = block {\n                        println!(\"[工具调用] {}\", name);\n                        let result = tools[name].execute(input.clone()).await;\n                        results.push(json!({ \"type\": \"tool_result\", \"tool_use_id\": id, \"content\": result }));\n                    }\n                }\n                messages.push(Message { role: \"user\".to_string(), content: json!(results) });\n            } else {\n                for block in &response.content {\n                    if let ContentBlock::Text { text } = block {\n                        println!(\"\\nAgent: {}\", text);\n                    }\n                }\n                break;\n            }\n\n            // 每次工具执行后检查协议状态\n            let state = protocol.lock().unwrap().clone();\n            if matches!(state, Protocol::ShuttingDown { .. } | Protocol::Terminated) {\n                break;\n            }\n        }\n    }\n}\n\nasync fn call_api(\n    client: &reqwest::Client,\n    api_key: &str,\n    messages: &[Message],\n    tools: &[Value],\n    system: &str,\n) -> learn_claude_code_rust::ApiResponse {\n    let request = learn_claude_code_rust::ApiRequest {\n        model: \"claude-haiku-4-5-20251001\".to_string(),\n        max_tokens: 8096,\n        system: system.to_string(),\n        messages: messages.to_vec(),\n        tools: Some(tools.to_vec()),\n    };\n    client.post(\"https://api.ofox.ai/anthropic/v1/messages\")\n        .header(\"Authorization\", format!(\"Bearer {}\", api_key))\n        .header(\"anthropic-version\", \"2023-06-01\")\n        .header(\"content-type\", \"application/json\")\n        .json(&request).send().await.unwrap()\n        .json::<learn_claude_code_rust::ApiResponse>().await.unwrap()\n}\n"
+    },
+    {
+      "id": "s11",
+      "filename": "s11_autonomous.rs",
+      "title": "Autonomous Agents",
+      "subtitle": "Scan Board, Claim Tasks",
+      "loc": 317,
+      "tools": [
+        "bash",
+        "add_task",
+        "show_board"
+      ],
+      "newTools": [
+        "add_task",
+        "show_board"
+      ],
+      "coreAddition": "Task board polling + timeout-based self-governance",
+      "keyInsight": "Teammates scan the board and claim tasks themselves; no need for the lead to assign each one",
+      "classes": [
+        {
+          "name": "Task",
+          "startLine": 45,
+          "endLine": 50
+        },
+        {
+          "name": "BashTool",
+          "startLine": 108,
+          "endLine": 108
+        },
+        {
+          "name": "AddTaskTool",
+          "startLine": 214,
+          "endLine": 215
+        },
+        {
+          "name": "ShowBoardTool",
+          "startLine": 246,
+          "endLine": 247
+        }
+      ],
+      "functions": [
+        {
+          "name": "make_board",
+          "signature": "fn make_board() -> TaskBoard {",
+          "startLine": 56
+        },
+        {
+          "name": "board_add",
+          "signature": "fn board_add(board: &TaskBoard, title: &str, role_hint: &str) -> u32 {",
+          "startLine": 61
+        },
+        {
+          "name": "board_claim",
+          "signature": "fn board_claim(board: &TaskBoard, role: &str) -> Option<Task> {",
+          "startLine": 75
+        },
+        {
+          "name": "board_complete",
+          "signature": "fn board_complete(board: &TaskBoard, id: u32, result: &str) {",
+          "startLine": 89
+        },
+        {
+          "name": "board_print",
+          "signature": "fn board_print(board: &TaskBoard) {",
+          "startLine": 97
+        },
+        {
+          "name": "run_task",
+          "signature": "async fn run_task(",
+          "startLine": 134
+        },
+        {
+          "name": "teammate_worker",
+          "signature": "async fn teammate_worker(",
+          "startLine": 178
+        },
+        {
+          "name": "main",
+          "signature": "async fn main() {",
+          "startLine": 272
+        },
+        {
+          "name": "call_api",
+          "signature": "async fn call_api(",
+          "startLine": 371
+        }
+      ],
+      "layer": "collaboration",
+      "source": "// S11 Autonomous — teammate 自主扫描任务板并认领任务\n//\n// 核心概念：\n//   - 共享任务板 TaskBoard（Arc<Mutex<Vec<Task>>>），多个 teammate 并发访问\n//   - 每个 teammate 是一个 tokio task，用 loop + select! 在\"轮询任务\"和\"等待退出\"之间切换\n//   - teammate 只认领与自己 role 匹配的任务（task.role_hint）\n//   - 主 agent 负责往任务板上添加任务，用户也可以通过命令添加\n//\n// Rust 重点：Arc<Mutex<T>>、tokio::spawn、loop + select!、enum 状态机\n\nuse async_trait::async_trait;\nuse learn_claude_code_rust::{ContentBlock, Message, Tool};\nuse serde::{Deserialize, Serialize};\nuse serde_json::{json, Value};\nuse std::collections::HashMap;\nuse std::io::{Write as IoWrite, stdin, stdout};\nuse std::sync::{Arc, Mutex};\nuse tokio::sync::mpsc;\nuse tokio::time::{Duration, sleep};\n\n// ── 任务板数据结构 ────────────────────────────────────────────────────────────\n\n#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]\n#[serde(rename_all = \"snake_case\")]\nenum TaskStatus {\n    /// 待认领\n    Open,\n    /// 已被某 teammate 认领，正在处理\n    InProgress { claimed_by: String },\n    /// 已完成\n    Done { result: String },\n}\n\nimpl std::fmt::Display for TaskStatus {\n    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        match self {\n            TaskStatus::Open => write!(f, \"open\"),\n            TaskStatus::InProgress { claimed_by } => write!(f, \"in_progress({})\", claimed_by),\n            TaskStatus::Done { .. } => write!(f, \"done\"),\n        }\n    }\n}\n\n#[derive(Debug, Clone, Serialize, Deserialize)]\nstruct Task {\n    id: u32,\n    title: String,\n    /// 哪种角色适合处理（\"coder\" / \"reviewer\" / \"any\"）\n    role_hint: String,\n    status: TaskStatus,\n}\n\n/// 共享任务板\ntype TaskBoard = Arc<Mutex<Vec<Task>>>;\n\nfn make_board() -> TaskBoard {\n    Arc::new(Mutex::new(vec![]))\n}\n\n/// 往任务板加一个 Open 任务，返回新任务 id\nfn board_add(board: &TaskBoard, title: &str, role_hint: &str) -> u32 {\n    let mut tasks = board.lock().unwrap();\n    let id = tasks.iter().map(|t| t.id).max().unwrap_or(0) + 1;\n    tasks.push(Task {\n        id,\n        title: title.to_string(),\n        role_hint: role_hint.to_string(),\n        status: TaskStatus::Open,\n    });\n    println!(\"[任务板] 新增任务 #{} ({}) — {}\", id, role_hint, title);\n    id\n}\n\n/// 认领一个 Open 且 role_hint 匹配的任务，返回认领的 Task（已设为 InProgress）\nfn board_claim(board: &TaskBoard, role: &str) -> Option<Task> {\n    let mut tasks = board.lock().unwrap();\n    for task in tasks.iter_mut() {\n        if task.status == TaskStatus::Open\n            && (task.role_hint == role || task.role_hint == \"any\")\n        {\n            task.status = TaskStatus::InProgress { claimed_by: role.to_string() };\n            return Some(task.clone());\n        }\n    }\n    None\n}\n\n/// 把 InProgress 任务标为 Done\nfn board_complete(board: &TaskBoard, id: u32, result: &str) {\n    let mut tasks = board.lock().unwrap();\n    if let Some(task) = tasks.iter_mut().find(|t| t.id == id) {\n        task.status = TaskStatus::Done { result: result.to_string() };\n    }\n}\n\n/// 打印任务板概览\nfn board_print(board: &TaskBoard) {\n    let tasks = board.lock().unwrap();\n    println!(\"\\n── 任务板 ──────────────────────────────────\");\n    for task in tasks.iter() {\n        println!(\"  #{} [{}] ({}) {}\", task.id, task.status, task.role_hint, task.title);\n    }\n    println!(\"────────────────────────────────────────────\\n\");\n}\n\n// ── API 工具类（供 teammate agent loop 使用）─────────────────────────────────\n\nstruct BashTool;\n#[async_trait]\nimpl Tool for BashTool {\n    fn name(&self) -> &str { \"bash\" }\n    fn definition(&self) -> Value {\n        json!({\n            \"name\": \"bash\",\n            \"description\": \"执行 bash 命令\",\n            \"input_schema\": {\n                \"type\": \"object\",\n                \"properties\": { \"command\": { \"type\": \"string\" } },\n                \"required\": [\"command\"]\n            }\n        })\n    }\n    async fn execute(&self, input: Value) -> String {\n        let out = std::process::Command::new(\"sh\")\n            .arg(\"-c\").arg(input[\"command\"].as_str().unwrap_or(\"\"))\n            .output().expect(\"failed\");\n        String::from_utf8_lossy(&out.stdout).to_string()\n            + &String::from_utf8_lossy(&out.stderr)\n    }\n}\n\n// ── teammate agent loop ───────────────────────────────────────────────────────\n\nasync fn run_task(\n    client: &reqwest::Client,\n    api_key: &str,\n    system_prompt: &str,\n    task_title: &str,\n) -> String {\n    let tools: HashMap<String, Box<dyn Tool>> = {\n        let mut m: HashMap<String, Box<dyn Tool>> = HashMap::new();\n        m.insert(\"bash\".to_string(), Box::new(BashTool));\n        m\n    };\n    let tool_defs: Vec<Value> = tools.values().map(|t| t.definition()).collect();\n\n    let mut messages = vec![Message {\n        role: \"user\".to_string(),\n        content: json!(task_title),\n    }];\n\n    loop {\n        let response = call_api(client, api_key, &messages, &tool_defs, system_prompt).await;\n        if response.stop_reason.as_deref() == Some(\"tool_use\") {\n            messages.push(Message { role: \"assistant\".to_string(), content: json!(response.content) });\n            let mut results = vec![];\n            for block in &response.content {\n                if let ContentBlock::ToolUse { id, name, input } = block {\n                    let result = tools[name].execute(input.clone()).await;\n                    results.push(json!({ \"type\": \"tool_result\", \"tool_use_id\": id, \"content\": result }));\n                }\n            }\n            messages.push(Message { role: \"user\".to_string(), content: json!(results) });\n        } else {\n            return response.content.iter()\n                .filter_map(|b| if let ContentBlock::Text { text } = b { Some(text.clone()) } else { None })\n                .collect::<Vec<_>>().join(\"\\n\");\n        }\n    }\n}\n\n// ── teammate 自主轮询逻辑 ─────────────────────────────────────────────────────\n\n/// 每个 teammate 作为独立 tokio task 运行\n/// - 每隔 POLL_INTERVAL 扫描任务板\n/// - 发现匹配的 Open 任务就认领并处理\n/// - 收到 shutdown 信号后退出\nasync fn teammate_worker(\n    name: String,\n    role: String,\n    system_prompt: String,\n    board: TaskBoard,\n    client: Arc<reqwest::Client>,\n    api_key: Arc<String>,\n    mut shutdown: mpsc::Receiver<()>,\n) {\n    const POLL_INTERVAL: Duration = Duration::from_secs(2);\n\n    println!(\"[{}] 上线，开始扫描任务板 (role={})\", name, role);\n\n    loop {\n        // select! 同时等待：定时器到期 OR 收到 shutdown\n        tokio::select! {\n            _ = sleep(POLL_INTERVAL) => {\n                // 尝试认领一个任务\n                if let Some(task) = board_claim(&board, &role) {\n                    println!(\"[{}] 认领任务 #{}: {}\", name, task.id, task.title);\n                    let result = run_task(&client, &api_key, &system_prompt, &task.title).await;\n                    board_complete(&board, task.id, &result);\n                    println!(\"[{}] 完成任务 #{}\", name, task.id);\n                }\n                // 没有任务时静默等待下一轮\n            }\n            _ = shutdown.recv() => {\n                println!(\"[{}] 收到关闭信号，退出。\", name);\n                break;\n            }\n        }\n    }\n}\n\n// ── 主 agent 工具：往任务板添加任务 ──────────────────────────────────────────\n\nstruct AddTaskTool {\n    board: TaskBoard,\n}\n#[async_trait]\nimpl Tool for AddTaskTool {\n    fn name(&self) -> &str { \"add_task\" }\n    fn definition(&self) -> Value {\n        json!({\n            \"name\": \"add_task\",\n            \"description\": \"往共享任务板添加一个新任务。teammate 会自动认领匹配的任务。\",\n            \"input_schema\": {\n                \"type\": \"object\",\n                \"properties\": {\n                    \"title\": { \"type\": \"string\", \"description\": \"任务描述\" },\n                    \"role_hint\": {\n                        \"type\": \"string\",\n                        \"description\": \"适合处理该任务的角色: coder / reviewer / any\",\n                        \"enum\": [\"coder\", \"reviewer\", \"any\"]\n                    }\n                },\n                \"required\": [\"title\", \"role_hint\"]\n            }\n        })\n    }\n    async fn execute(&self, input: Value) -> String {\n        let title = input[\"title\"].as_str().unwrap_or(\"untitled\");\n        let role_hint = input[\"role_hint\"].as_str().unwrap_or(\"any\");\n        let id = board_add(&self.board, title, role_hint);\n        format!(\"任务 #{} 已添加到任务板，等待 teammate 认领。\", id)\n    }\n}\n\nstruct ShowBoardTool {\n    board: TaskBoard,\n}\n#[async_trait]\nimpl Tool for ShowBoardTool {\n    fn name(&self) -> &str { \"show_board\" }\n    fn definition(&self) -> Value {\n        json!({\n            \"name\": \"show_board\",\n            \"description\": \"显示当前任务板上所有任务的状态。\",\n            \"input_schema\": { \"type\": \"object\", \"properties\": {} }\n        })\n    }\n    async fn execute(&self, _input: Value) -> String {\n        let tasks = self.board.lock().unwrap().clone();\n        if tasks.is_empty() {\n            return \"任务板为空。\".to_string();\n        }\n        tasks.iter().map(|t| format!(\"#{} [{}] ({}) {}\", t.id, t.status, t.role_hint, t.title))\n            .collect::<Vec<_>>().join(\"\\n\")\n    }\n}\n\n// ── main ──────────────────────────────────────────────────────────────────────\n\n#[tokio::main]\nasync fn main() {\n    let api_key = Arc::new(std::env::var(\"ANTHROPIC_API_KEY\").expect(\"需要 ANTHROPIC_API_KEY\"));\n    let client = Arc::new(reqwest::Client::new());\n    let board = make_board();\n\n    // 启动 teammate workers，每个有独立的 shutdown channel\n    let (shutdown_coder_tx, shutdown_coder_rx) = mpsc::channel::<()>(1);\n    let (shutdown_reviewer_tx, shutdown_reviewer_rx) = mpsc::channel::<()>(1);\n\n    tokio::spawn(teammate_worker(\n        \"coder\".to_string(),\n        \"coder\".to_string(),\n        \"你是 Rust 代码生成专家。收到任务后直接给出简洁、正确的实现，并简要说明思路。\".to_string(),\n        board.clone(),\n        client.clone(),\n        api_key.clone(),\n        shutdown_coder_rx,\n    ));\n\n    tokio::spawn(teammate_worker(\n        \"reviewer\".to_string(),\n        \"reviewer\".to_string(),\n        \"你是严格的代码审查专家。找出潜在 bug、性能问题和不符合 Rust 惯用法的写法。\".to_string(),\n        board.clone(),\n        client.clone(),\n        api_key.clone(),\n        shutdown_reviewer_rx,\n    ));\n\n    // 主 agent 工具\n    let mut tools: HashMap<String, Box<dyn Tool>> = HashMap::new();\n    tools.insert(\"add_task\".to_string(), Box::new(AddTaskTool { board: board.clone() }));\n    tools.insert(\"show_board\".to_string(), Box::new(ShowBoardTool { board: board.clone() }));\n    let tool_defs: Vec<Value> = tools.values().map(|t| t.definition()).collect();\n\n    let system = \"你是任务协调者。\\\n        - 用 add_task 把用户需求拆解成小任务，指定合适的 role_hint (coder/reviewer/any)\\\n        - 用 show_board 查看任务进度\\\n        - teammate 会自动认领并完成任务，你不需要手动分配\\\n        把用户需求拆分得越细越好，每个任务一个职责。\";\n\n    println!(\"=== S11 Autonomous (输入 '退出' 结束，'状态' 查看任务板) ===\");\n\n    let mut messages: Vec<Message> = vec![];\n\n    loop {\n        print!(\"\\n用户> \");\n        IoWrite::flush(&mut stdout()).unwrap();\n        let mut input = String::new();\n        stdin().read_line(&mut input).unwrap();\n        let input = input.trim();\n\n        match input {\n            \"退出\" | \"quit\" | \"exit\" => {\n                println!(\"正在关闭所有 teammate...\");\n                let _ = shutdown_coder_tx.send(()).await;\n                let _ = shutdown_reviewer_tx.send(()).await;\n                // 给 worker 一点时间退出\n                sleep(Duration::from_millis(500)).await;\n                println!(\"已关闭。\");\n                break;\n            }\n            \"状态\" | \"board\" => {\n                board_print(&board);\n                continue;\n            }\n            \"\" => continue,\n            _ => {}\n        }\n\n        messages.push(Message { role: \"user\".to_string(), content: json!(input) });\n\n        // 主 agent 单轮推理\n        loop {\n            let response = call_api(&client, &api_key, &messages, &tool_defs, system).await;\n\n            if response.stop_reason.as_deref() == Some(\"tool_use\") {\n                messages.push(Message { role: \"assistant\".to_string(), content: json!(response.content) });\n                let mut results = vec![];\n                for block in &response.content {\n                    if let ContentBlock::ToolUse { id, name, input } = block {\n                        println!(\"[主agent 调用] {}\", name);\n                        let result = tools[name].execute(input.clone()).await;\n                        results.push(json!({ \"type\": \"tool_result\", \"tool_use_id\": id, \"content\": result }));\n                    }\n                }\n                messages.push(Message { role: \"user\".to_string(), content: json!(results) });\n            } else {\n                for block in &response.content {\n                    if let ContentBlock::Text { text } = block {\n                        println!(\"\\nAgent: {}\", text);\n                    }\n                }\n                break;\n            }\n        }\n    }\n}\n\nasync fn call_api(\n    client: &reqwest::Client,\n    api_key: &str,\n    messages: &[Message],\n    tools: &[Value],\n    system: &str,\n) -> learn_claude_code_rust::ApiResponse {\n    let request = learn_claude_code_rust::ApiRequest {\n        model: \"claude-haiku-4-5-20251001\".to_string(),\n        max_tokens: 8096,\n        system: system.to_string(),\n        messages: messages.to_vec(),\n        tools: Some(tools.to_vec()),\n    };\n    client.post(\"https://api.ofox.ai/anthropic/v1/messages\")\n        .header(\"Authorization\", format!(\"Bearer {}\", api_key))\n        .header(\"anthropic-version\", \"2023-06-01\")\n        .header(\"content-type\", \"application/json\")\n        .json(&request).send().await.unwrap()\n        .json::<learn_claude_code_rust::ApiResponse>().await.unwrap()\n}\n"
+    },
+    {
+      "id": "s12",
+      "filename": "s12_worktree.rs",
+      "title": "Worktree + Task Isolation",
+      "subtitle": "Isolate by Directory",
+      "loc": 361,
+      "tools": [
+        "bash",
+        "write_file",
+        "add_task",
+        "show_board"
+      ],
+      "newTools": [
+        "write_file"
+      ],
+      "coreAddition": "Composable worktree lifecycle + event stream over a shared task board",
+      "keyInsight": "Each works in its own directory; tasks manage goals, worktrees manage directories, bound by ID",
+      "classes": [
+        {
+          "name": "Task",
+          "startLine": 43,
+          "endLine": 47
+        },
+        {
+          "name": "BashTool",
+          "startLine": 101,
+          "endLine": 102
+        },
+        {
+          "name": "WriteFileTool",
+          "startLine": 138,
+          "endLine": 139
+        },
+        {
+          "name": "AddTaskTool",
+          "startLine": 245,
+          "endLine": 245
+        },
+        {
+          "name": "ShowBoardTool",
+          "startLine": 273,
+          "endLine": 273
+        }
+      ],
+      "functions": [
+        {
+          "name": "make_board",
+          "signature": "fn make_board() -> TaskBoard {",
+          "startLine": 52
+        },
+        {
+          "name": "board_add",
+          "signature": "fn board_add(board: &TaskBoard, title: &str, role_hint: &str) -> u32 {",
+          "startLine": 56
+        },
+        {
+          "name": "board_claim",
+          "signature": "fn board_claim(board: &TaskBoard, role: &str) -> Option<Task> {",
+          "startLine": 69
+        },
+        {
+          "name": "board_complete",
+          "signature": "fn board_complete(board: &TaskBoard, id: u32, result: &str) {",
+          "startLine": 82
+        },
+        {
+          "name": "board_print",
+          "signature": "fn board_print(board: &TaskBoard) {",
+          "startLine": 89
+        },
+        {
+          "name": "run_task",
+          "signature": "async fn run_task(",
+          "startLine": 172
+        },
+        {
+          "name": "teammate_worker",
+          "signature": "async fn teammate_worker(",
+          "startLine": 211
+        },
+        {
+          "name": "main",
+          "signature": "async fn main() {",
+          "startLine": 292
+        },
+        {
+          "name": "call_api",
+          "signature": "async fn call_api(",
+          "startLine": 403
+        }
+      ],
+      "layer": "collaboration",
+      "source": "// S12 Worktree Isolation — 每个 teammate 在独立 CWD 下操作，防止互相干扰\n//\n// 核心概念：\n//   - 在 s11 基础上，给每个 teammate_worker 分配独立的工作目录（cwd）\n//   - BashTool 通过 .current_dir(&cwd) 把命令限定在各自目录\n//   - 主 agent 也有自己的 cwd（项目根目录）\n//   - 退出时清理临时目录\n//\n// Rust 重点：PathBuf 传参、Command::current_dir、临时目录管理\n\nuse async_trait::async_trait;\nuse learn_claude_code_rust::{ContentBlock, Message, Tool};\nuse serde::{Deserialize, Serialize};\nuse serde_json::{json, Value};\nuse std::collections::HashMap;\nuse std::io::{Write as IoWrite, stdin, stdout};\nuse std::path::PathBuf;\nuse std::sync::{Arc, Mutex};\nuse tokio::sync::mpsc;\nuse tokio::time::{Duration, sleep};\n\n// ── 任务板（与 s11 相同）────────────────────────────────────────────────────\n\n#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]\n#[serde(rename_all = \"snake_case\")]\nenum TaskStatus {\n    Open,\n    InProgress { claimed_by: String },\n    Done { result: String },\n}\n\nimpl std::fmt::Display for TaskStatus {\n    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        match self {\n            TaskStatus::Open => write!(f, \"open\"),\n            TaskStatus::InProgress { claimed_by } => write!(f, \"in_progress({})\", claimed_by),\n            TaskStatus::Done { .. } => write!(f, \"done\"),\n        }\n    }\n}\n\n#[derive(Debug, Clone, Serialize, Deserialize)]\nstruct Task {\n    id: u32,\n    title: String,\n    role_hint: String,\n    status: TaskStatus,\n}\n\ntype TaskBoard = Arc<Mutex<Vec<Task>>>;\n\nfn make_board() -> TaskBoard {\n    Arc::new(Mutex::new(vec![]))\n}\n\nfn board_add(board: &TaskBoard, title: &str, role_hint: &str) -> u32 {\n    let mut tasks = board.lock().unwrap();\n    let id = tasks.iter().map(|t| t.id).max().unwrap_or(0) + 1;\n    tasks.push(Task {\n        id,\n        title: title.to_string(),\n        role_hint: role_hint.to_string(),\n        status: TaskStatus::Open,\n    });\n    println!(\"[任务板] 新增任务 #{} ({}) — {}\", id, role_hint, title);\n    id\n}\n\nfn board_claim(board: &TaskBoard, role: &str) -> Option<Task> {\n    let mut tasks = board.lock().unwrap();\n    for task in tasks.iter_mut() {\n        if task.status == TaskStatus::Open\n            && (task.role_hint == role || task.role_hint == \"any\")\n        {\n            task.status = TaskStatus::InProgress { claimed_by: role.to_string() };\n            return Some(task.clone());\n        }\n    }\n    None\n}\n\nfn board_complete(board: &TaskBoard, id: u32, result: &str) {\n    let mut tasks = board.lock().unwrap();\n    if let Some(task) = tasks.iter_mut().find(|t| t.id == id) {\n        task.status = TaskStatus::Done { result: result.to_string() };\n    }\n}\n\nfn board_print(board: &TaskBoard) {\n    let tasks = board.lock().unwrap();\n    println!(\"\\n── 任务板 ──────────────────────────────────\");\n    for task in tasks.iter() {\n        println!(\"  #{} [{}] ({}) {}\", task.id, task.status, task.role_hint, task.title);\n    }\n    println!(\"────────────────────────────────────────────\\n\");\n}\n\n// ── 带 cwd 的工具 ─────────────────────────────────────────────────────────────\n\n/// BashTool：在指定目录下执行命令\nstruct BashTool {\n    cwd: PathBuf,\n}\n\n#[async_trait]\nimpl Tool for BashTool {\n    fn name(&self) -> &str { \"bash\" }\n    fn definition(&self) -> Value {\n        json!({\n            \"name\": \"bash\",\n            \"description\": \"在 teammate 的隔离工作目录下执行 bash 命令\",\n            \"input_schema\": {\n                \"type\": \"object\",\n                \"properties\": { \"command\": { \"type\": \"string\" } },\n                \"required\": [\"command\"]\n            }\n        })\n    }\n    async fn execute(&self, input: Value) -> String {\n        let cmd = input[\"command\"].as_str().unwrap_or(\"\");\n        let out = std::process::Command::new(\"sh\")\n            .arg(\"-c\")\n            .arg(cmd)\n            .current_dir(&self.cwd)  // 关键：限定在各自的工作目录\n            .output();\n        match out {\n            Ok(o) => {\n                let stdout = String::from_utf8_lossy(&o.stdout).to_string();\n                let stderr = String::from_utf8_lossy(&o.stderr).to_string();\n                if stderr.is_empty() { stdout } else { format!(\"{}{}\", stdout, stderr) }\n            }\n            Err(e) => format!(\"执行失败: {}\", e),\n        }\n    }\n}\n\n/// WriteFileTool：在 cwd 下写文件\nstruct WriteFileTool {\n    cwd: PathBuf,\n}\n\n#[async_trait]\nimpl Tool for WriteFileTool {\n    fn name(&self) -> &str { \"write_file\" }\n    fn definition(&self) -> Value {\n        json!({\n            \"name\": \"write_file\",\n            \"description\": \"在 teammate 的隔离目录下写入文件\",\n            \"input_schema\": {\n                \"type\": \"object\",\n                \"properties\": {\n                    \"path\": { \"type\": \"string\", \"description\": \"相对于工作目录的文件路径\" },\n                    \"content\": { \"type\": \"string\" }\n                },\n                \"required\": [\"path\", \"content\"]\n            }\n        })\n    }\n    async fn execute(&self, input: Value) -> String {\n        let rel_path = input[\"path\"].as_str().unwrap_or(\"output.txt\");\n        let content = input[\"content\"].as_str().unwrap_or(\"\");\n        let full_path = self.cwd.join(rel_path);\n        match std::fs::write(&full_path, content) {\n            Ok(_) => format!(\"已写入 {}\", full_path.display()),\n            Err(e) => format!(\"写入失败: {}\", e),\n        }\n    }\n}\n\n// ── teammate agent loop ───────────────────────────────────────────────────────\n\nasync fn run_task(\n    client: &reqwest::Client,\n    api_key: &str,\n    system_prompt: &str,\n    task_title: &str,\n    cwd: &PathBuf,\n) -> String {\n    let mut tools: HashMap<String, Box<dyn Tool>> = HashMap::new();\n    tools.insert(\"bash\".to_string(), Box::new(BashTool { cwd: cwd.clone() }));\n    tools.insert(\"write_file\".to_string(), Box::new(WriteFileTool { cwd: cwd.clone() }));\n    let tool_defs: Vec<Value> = tools.values().map(|t| t.definition()).collect();\n\n    let mut messages = vec![Message {\n        role: \"user\".to_string(),\n        content: json!(task_title),\n    }];\n\n    loop {\n        let response = call_api(client, api_key, &messages, &tool_defs, system_prompt).await;\n        if response.stop_reason.as_deref() == Some(\"tool_use\") {\n            messages.push(Message { role: \"assistant\".to_string(), content: json!(response.content) });\n            let mut results = vec![];\n            for block in &response.content {\n                if let ContentBlock::ToolUse { id, name, input } = block {\n                    let result = tools[name].execute(input.clone()).await;\n                    results.push(json!({ \"type\": \"tool_result\", \"tool_use_id\": id, \"content\": result }));\n                }\n            }\n            messages.push(Message { role: \"user\".to_string(), content: json!(results) });\n        } else {\n            return response.content.iter()\n                .filter_map(|b| if let ContentBlock::Text { text } = b { Some(text.clone()) } else { None })\n                .collect::<Vec<_>>().join(\"\\n\");\n        }\n    }\n}\n\n// ── teammate 自主轮询（带 cwd 隔离）─────────────────────────────────────────\n\nasync fn teammate_worker(\n    name: String,\n    role: String,\n    system_prompt: String,\n    cwd: PathBuf,  // 独立工作目录\n    board: TaskBoard,\n    client: Arc<reqwest::Client>,\n    api_key: Arc<String>,\n    mut shutdown: mpsc::Receiver<()>,\n) {\n    const POLL_INTERVAL: Duration = Duration::from_secs(2);\n\n    println!(\"[{}] 上线，工作目录: {}\", name, cwd.display());\n\n    loop {\n        tokio::select! {\n            _ = sleep(POLL_INTERVAL) => {\n                if let Some(task) = board_claim(&board, &role) {\n                    println!(\"[{}] 认领任务 #{}: {}\", name, task.id, task.title);\n                    let result = run_task(&client, &api_key, &system_prompt, &task.title, &cwd).await;\n                    board_complete(&board, task.id, &result);\n                    println!(\"[{}] 完成任务 #{}\\n结果: {}\", name, task.id, &result[..result.len().min(100)]);\n                }\n            }\n            _ = shutdown.recv() => {\n                println!(\"[{}] 收到关闭信号，退出。\", name);\n                break;\n            }\n        }\n    }\n}\n\n// ── 主 agent 工具 ─────────────────────────────────────────────────────────────\n\nstruct AddTaskTool { board: TaskBoard }\n#[async_trait]\nimpl Tool for AddTaskTool {\n    fn name(&self) -> &str { \"add_task\" }\n    fn definition(&self) -> Value {\n        json!({\n            \"name\": \"add_task\",\n            \"description\": \"往共享任务板添加一个新任务\",\n            \"input_schema\": {\n                \"type\": \"object\",\n                \"properties\": {\n                    \"title\": { \"type\": \"string\" },\n                    \"role_hint\": { \"type\": \"string\", \"enum\": [\"coder\", \"reviewer\", \"any\"] }\n                },\n                \"required\": [\"title\", \"role_hint\"]\n            }\n        })\n    }\n    async fn execute(&self, input: Value) -> String {\n        let id = board_add(\n            &self.board,\n            input[\"title\"].as_str().unwrap_or(\"untitled\"),\n            input[\"role_hint\"].as_str().unwrap_or(\"any\"),\n        );\n        format!(\"任务 #{} 已添加，等待 teammate 认领。\", id)\n    }\n}\n\nstruct ShowBoardTool { board: TaskBoard }\n#[async_trait]\nimpl Tool for ShowBoardTool {\n    fn name(&self) -> &str { \"show_board\" }\n    fn definition(&self) -> Value {\n        json!({ \"name\": \"show_board\", \"description\": \"显示任务板\", \"input_schema\": { \"type\": \"object\", \"properties\": {} } })\n    }\n    async fn execute(&self, _: Value) -> String {\n        let tasks = self.board.lock().unwrap().clone();\n        if tasks.is_empty() { return \"任务板为空。\".to_string(); }\n        tasks.iter()\n            .map(|t| format!(\"#{} [{}] ({}) {}\", t.id, t.status, t.role_hint, t.title))\n            .collect::<Vec<_>>().join(\"\\n\")\n    }\n}\n\n// ── main ──────────────────────────────────────────────────────────────────────\n\n#[tokio::main]\nasync fn main() {\n    let api_key = Arc::new(std::env::var(\"ANTHROPIC_API_KEY\").expect(\"需要 ANTHROPIC_API_KEY\"));\n    let client = Arc::new(reqwest::Client::new());\n    let board = make_board();\n\n    // 为每个 teammate 创建隔离的临时工作目录\n    let base_dir = std::env::temp_dir().join(\"s12_worktree\");\n    let coder_dir = base_dir.join(\"coder\");\n    let reviewer_dir = base_dir.join(\"reviewer\");\n    std::fs::create_dir_all(&coder_dir).unwrap();\n    std::fs::create_dir_all(&reviewer_dir).unwrap();\n    println!(\"[初始化] coder  工作目录: {}\", coder_dir.display());\n    println!(\"[初始化] reviewer 工作目录: {}\", reviewer_dir.display());\n\n    let (shutdown_coder_tx, shutdown_coder_rx) = mpsc::channel::<()>(1);\n    let (shutdown_reviewer_tx, shutdown_reviewer_rx) = mpsc::channel::<()>(1);\n\n    tokio::spawn(teammate_worker(\n        \"coder\".to_string(),\n        \"coder\".to_string(),\n        \"你是 Rust 代码生成专家。把生成的代码用 write_file 工具写到当前目录，文件名用 .rs 结尾。\".to_string(),\n        coder_dir.clone(),\n        board.clone(),\n        client.clone(),\n        api_key.clone(),\n        shutdown_coder_rx,\n    ));\n\n    tokio::spawn(teammate_worker(\n        \"reviewer\".to_string(),\n        \"reviewer\".to_string(),\n        \"你是代码审查专家。把审查意见用 write_file 工具写到 review.md，指出潜在问题。\".to_string(),\n        reviewer_dir.clone(),\n        board.clone(),\n        client.clone(),\n        api_key.clone(),\n        shutdown_reviewer_rx,\n    ));\n\n    // 主 agent\n    let mut tools: HashMap<String, Box<dyn Tool>> = HashMap::new();\n    tools.insert(\"add_task\".to_string(), Box::new(AddTaskTool { board: board.clone() }));\n    tools.insert(\"show_board\".to_string(), Box::new(ShowBoardTool { board: board.clone() }));\n    let tool_defs: Vec<Value> = tools.values().map(|t| t.definition()).collect();\n\n    let system = \"你是任务协调者。用 add_task 把用户需求拆成小任务，用 show_board 查看进度。\\\n        coder 负责写代码，reviewer 负责审查，any 两者都可以认领。\";\n\n    println!(\"\\n=== S12 Worktree Isolation ===\");\n    println!(\"命令: '退出' 结束 | '状态' 查看任务板 | '目录' 查看 teammate 工作目录\\n\");\n\n    let mut messages: Vec<Message> = vec![];\n\n    loop {\n        print!(\"用户> \");\n        IoWrite::flush(&mut stdout()).unwrap();\n        let mut input = String::new();\n        stdin().read_line(&mut input).unwrap();\n        let input = input.trim();\n\n        match input {\n            \"退出\" | \"quit\" | \"exit\" => {\n                println!(\"正在关闭 teammate...\");\n                let _ = shutdown_coder_tx.send(()).await;\n                let _ = shutdown_reviewer_tx.send(()).await;\n                sleep(Duration::from_millis(500)).await;\n                // 打印各 teammate 目录内容\n                println!(\"\\n── coder 工作目录内容 ──\");\n                let _ = std::process::Command::new(\"ls\").arg(\"-la\").arg(&coder_dir).status();\n                println!(\"\\n── reviewer 工作目录内容 ──\");\n                let _ = std::process::Command::new(\"ls\").arg(\"-la\").arg(&reviewer_dir).status();\n                println!(\"\\n已关闭。工作目录保留在 {}\", base_dir.display());\n                break;\n            }\n            \"状态\" | \"board\" => { board_print(&board); continue; }\n            \"目录\" | \"dirs\" => {\n                println!(\"coder    → {}\", coder_dir.display());\n                println!(\"reviewer → {}\", reviewer_dir.display());\n                continue;\n            }\n            \"\" => continue,\n            _ => {}\n        }\n\n        messages.push(Message { role: \"user\".to_string(), content: json!(input) });\n\n        loop {\n            let response = call_api(&client, &api_key, &messages, &tool_defs, system).await;\n            if response.stop_reason.as_deref() == Some(\"tool_use\") {\n                messages.push(Message { role: \"assistant\".to_string(), content: json!(response.content) });\n                let mut results = vec![];\n                for block in &response.content {\n                    if let ContentBlock::ToolUse { id, name, input } = block {\n                        println!(\"[主agent] 调用 {}\", name);\n                        let result = tools[name].execute(input.clone()).await;\n                        results.push(json!({ \"type\": \"tool_result\", \"tool_use_id\": id, \"content\": result }));\n                    }\n                }\n                messages.push(Message { role: \"user\".to_string(), content: json!(results) });\n            } else {\n                for block in &response.content {\n                    if let ContentBlock::Text { text } = block {\n                        println!(\"\\nAgent: {}\", text);\n                    }\n                }\n                break;\n            }\n        }\n    }\n}\n\nasync fn call_api(\n    client: &reqwest::Client,\n    api_key: &str,\n    messages: &[Message],\n    tools: &[Value],\n    system: &str,\n) -> learn_claude_code_rust::ApiResponse {\n    let request = learn_claude_code_rust::ApiRequest {\n        model: \"claude-haiku-4-5-20251001\".to_string(),\n        max_tokens: 8096,\n        system: system.to_string(),\n        messages: messages.to_vec(),\n        tools: Some(tools.to_vec()),\n    };\n    client.post(\"https://api.ofox.ai/anthropic/v1/messages\")\n        .header(\"Authorization\", format!(\"Bearer {}\", api_key))\n        .header(\"anthropic-version\", \"2023-06-01\")\n        .header(\"content-type\", \"application/json\")\n        .json(&request).send().await.unwrap()\n        .json::<learn_claude_code_rust::ApiResponse>().await.unwrap()\n}\n"
     }
   ],
   "diffs": [
@@ -102,6 +755,164 @@
         "edit_file"
       ],
       "locDelta": 124
+    },
+    {
+      "from": "s02",
+      "to": "s03",
+      "newClasses": [
+        "TodoItem",
+        "TodoManager",
+        "TodoWriteTool"
+      ],
+      "newFunctions": [],
+      "newTools": [
+        "todo_write"
+      ],
+      "locDelta": 15
+    },
+    {
+      "from": "s03",
+      "to": "s04",
+      "newClasses": [
+        "ReadFileTool",
+        "DispatchAgentTool"
+      ],
+      "newFunctions": [
+        "agent_loop"
+      ],
+      "newTools": [
+        "read_file",
+        "dispatch_agent"
+      ],
+      "locDelta": 8
+    },
+    {
+      "from": "s04",
+      "to": "s05",
+      "newClasses": [
+        "SkillLoaderTool"
+      ],
+      "newFunctions": [
+        "list_skills"
+      ],
+      "newTools": [
+        "load_skill"
+      ],
+      "locDelta": -39
+    },
+    {
+      "from": "s05",
+      "to": "s06",
+      "newClasses": [],
+      "newFunctions": [
+        "summarize",
+        "maybe_compact"
+      ],
+      "newTools": [],
+      "locDelta": 41
+    },
+    {
+      "from": "s06",
+      "to": "s07",
+      "newClasses": [
+        "Task",
+        "TaskManager",
+        "CreateTaskTool",
+        "UpdateTaskTool",
+        "ListTasksTool",
+        "GetNextTasksTool"
+      ],
+      "newFunctions": [],
+      "newTools": [
+        "create_task",
+        "update_task",
+        "list_tasks",
+        "get_next_tasks"
+      ],
+      "locDelta": 92
+    },
+    {
+      "from": "s07",
+      "to": "s08",
+      "newClasses": [
+        "BgTask",
+        "RunBackgroundTool",
+        "CheckBackgroundTool",
+        "ListBackgroundTool"
+      ],
+      "newFunctions": [],
+      "newTools": [
+        "run_background",
+        "check_background",
+        "list_background"
+      ],
+      "locDelta": -70
+    },
+    {
+      "from": "s08",
+      "to": "s09",
+      "newClasses": [
+        "Teammate",
+        "BashTool",
+        "SendMessageTool"
+      ],
+      "newFunctions": [
+        "teammate_loop"
+      ],
+      "newTools": [
+        "bash",
+        "send_message"
+      ],
+      "locDelta": -19
+    },
+    {
+      "from": "s09",
+      "to": "s10",
+      "newClasses": [
+        "ShutdownTool",
+        "PlanRequestTool"
+      ],
+      "newFunctions": [],
+      "newTools": [
+        "shutdown",
+        "request_plan_approval"
+      ],
+      "locDelta": 140
+    },
+    {
+      "from": "s10",
+      "to": "s11",
+      "newClasses": [
+        "Task",
+        "AddTaskTool",
+        "ShowBoardTool"
+      ],
+      "newFunctions": [
+        "make_board",
+        "board_add",
+        "board_claim",
+        "board_complete",
+        "board_print",
+        "run_task",
+        "teammate_worker"
+      ],
+      "newTools": [
+        "add_task",
+        "show_board"
+      ],
+      "locDelta": -39
+    },
+    {
+      "from": "s11",
+      "to": "s12",
+      "newClasses": [
+        "WriteFileTool"
+      ],
+      "newFunctions": [],
+      "newTools": [
+        "write_file"
+      ],
+      "locDelta": 44
     }
   ]
 }
