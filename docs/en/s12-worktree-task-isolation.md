@@ -38,14 +38,14 @@ State machines:
 
 1. **Create a task.** Persist the goal first.
 
-```python
+```rust
 TASKS.create("Implement auth refactor")
 # -> .tasks/task_1.json  status=pending  worktree=""
 ```
 
 2. **Create a worktree and bind to the task.** Passing `task_id` auto-advances the task to `in_progress`.
 
-```python
+```rust
 WORKTREES.create("auth-refactor", task_id=1)
 # -> git worktree add -b wt/auth-refactor .worktrees/auth-refactor HEAD
 # -> index.json gets new entry, task_1.json gets worktree="auth-refactor"
@@ -53,7 +53,7 @@ WORKTREES.create("auth-refactor", task_id=1)
 
 The binding writes state to both sides:
 
-```python
+```rust
 def bind_worktree(self, task_id, worktree):
     task = self._load(task_id)
     task["worktree"] = worktree
@@ -64,7 +64,7 @@ def bind_worktree(self, task_id, worktree):
 
 3. **Run commands in the worktree.** `cwd` points to the isolated directory.
 
-```python
+```rust
 subprocess.run(command, shell=True, cwd=worktree_path,
                capture_output=True, text=True, timeout=300)
 ```
@@ -73,7 +73,7 @@ subprocess.run(command, shell=True, cwd=worktree_path,
    - `worktree_keep(name)` -- preserve the directory for later.
    - `worktree_remove(name, complete_task=True)` -- remove directory, complete the bound task, emit event. One call handles teardown + completion.
 
-```python
+```rust
 def remove(self, name, force=False, complete_task=False):
     self._run_git(["worktree", "remove", wt["path"]])
     if complete_task and wt.get("task_id") is not None:
@@ -111,7 +111,7 @@ After a crash, state reconstructs from `.tasks/` + `.worktrees/index.json` on di
 
 ```sh
 cd learn-claude-code
-python agents/s12_worktree_task_isolation.py
+cargo run --bin s12_worktree
 ```
 
 1. `Create tasks for backend auth and frontend login page, then list tasks.`

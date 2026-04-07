@@ -44,7 +44,7 @@ Trackers:
 
 1. The lead initiates shutdown by generating a request_id and sending through the inbox.
 
-```python
+```rust
 shutdown_requests = {}
 
 def handle_shutdown_request(teammate: str) -> str:
@@ -57,7 +57,7 @@ def handle_shutdown_request(teammate: str) -> str:
 
 2. The teammate receives the request and responds with approve/reject.
 
-```python
+```rust
 if tool_name == "shutdown_response":
     req_id = args["request_id"]
     approve = args["approve"]
@@ -69,7 +69,7 @@ if tool_name == "shutdown_response":
 
 3. Plan approval follows the identical pattern. The teammate submits a plan (generating a request_id), the lead reviews (referencing the same request_id).
 
-```python
+```rust
 plan_requests = {}
 
 def handle_plan_review(request_id, approve, feedback=""):
@@ -96,7 +96,7 @@ One FSM, two applications. The same `pending -> approved | rejected` state machi
 
 ```sh
 cd learn-claude-code
-python agents/s10_team_protocols.py
+cargo run --bin s10_protocols
 ```
 
 1. `Spawn alice as a coder. Then request her shutdown.`

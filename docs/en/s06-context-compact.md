@@ -46,59 +46,56 @@ continue    [Layer 2: auto_compact]
 
 1. **Layer 1 -- micro_compact**: Before each LLM call, replace old tool results with placeholders.
 
-```python
-def micro_compact(messages: list) -> list:
-    tool_results = []
-    for i, msg in enumerate(messages):
-        if msg["role"] == "user" and isinstance(msg.get("content"), list):
-            for j, part in enumerate(msg["content"]):
-                if isinstance(part, dict) and part.get("type") == "tool_result":
-                    tool_results.append((i, j, part))
-    if len(tool_results) <= KEEP_RECENT:
-        return messages
-    for _, _, part in tool_results[:-KEEP_RECENT]:
-        if len(part.get("content", "")) > 100:
-            part["content"] = f"[Previous: used {tool_name}]"
-    return messages
+```rust
+// When messages exceed threshold, drain the oldest half into a summary
+async fn maybe_compact(client: &Client, api_key: &str, messages: &mut Vec<Message>) {
+    if messages.len() < COMPACT_THRESHOLD { return; }
+    let half = messages.len() / 2;
+    let old: Vec<Message> = messages.drain(..half).collect();
+    let summary = summarize(client, api_key, &old).await;
+    messages.insert(0, Message { role: "user".into(),
+        content: json!(format!("[Conversation summary] {}", summary)) });
+    messages.insert(1, Message { role: "assistant".into(),
+        content: json!("Understood. Continuing.") });
+    println!("[compact] Compressed {} messages into summary", half);
+}
 ```
 
 2. **Layer 2 -- auto_compact**: When tokens exceed threshold, save full transcript to disk, then ask the LLM to summarize.
 
-```python
-def auto_compact(messages: list) -> list:
-    # Save transcript for recovery
-    transcript_path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
-    with open(transcript_path, "w") as f:
-        for msg in messages:
-            f.write(json.dumps(msg, default=str) + "\n")
-    # LLM summarizes
-    response = client.messages.create(
-        model=MODEL,
-        messages=[{"role": "user", "content":
-            "Summarize this conversation for continuity..."
-            + json.dumps(messages, default=str)[:80000]}],
-        max_tokens=2000,
-    )
-    return [
-        {"role": "user", "content": f"[Compressed]\n\n{response.content[0].text}"},
-        {"role": "assistant", "content": "Understood. Continuing."},
-    ]
+```rust
+async fn summarize(client: &Client, api_key: &str, messages: &[Message]) -> String {
+    let text = messages.iter()
+        .filter_map(|m| m.content.as_str()
+            .map(|s| format!("[{}] {}", m.role, s)))
+        .collect::<Vec<_>>().join("\n");
+
+    let req = vec![Message { role: "user".into(),
+        content: json!(format!("Summarize this conversation concisely:\n{}", text)) }];
+    let resp = call_api(client, api_key, &req, &[], "You are a summarization assistant").await;
+    resp.content.iter()
+        .filter_map(|b| if let ContentBlock::Text { text } = b
+            { Some(text.clone()) } else { None })
+        .collect::<Vec<_>>().join("")
+}
 ```
 
 3. **Layer 3 -- manual compact**: The `compact` tool triggers the same summarization on demand.
 
 4. The loop integrates all three:
 
-```python
-def agent_loop(messages: list):
-    while True:
-        micro_compact(messages)                        # Layer 1
-        if estimate_tokens(messages) > THRESHOLD:
-            messages[:] = auto_compact(messages)       # Layer 2
-        response = client.messages.create(...)
-        # ... tool execution ...
-        if manual_compact:
-            messages[:] = auto_compact(messages)       # Layer 3
+```rust
+loop {
+    // Compact if messages exceed threshold
+    maybe_compact(&client, &api_key, &mut messages).await;
+
+    let resp = call_api(&client, &api_key, &messages, &tool_defs, system).await;
+    if resp.stop_reason.as_deref() == Some("tool_use") {
+        // execute tools...
+    } else {
+        break;
+    }
+}
 ```
 
 Transcripts preserve full history on disk. Nothing is truly lost -- just moved out of active context.
@@ -117,7 +114,7 @@ Transcripts preserve full history on disk. Nothing is truly lost -- just moved o
 
 ```sh
 cd learn-claude-code
-python agents/s06_context_compact.py
+cargo run --bin s06_context_compact
 ```
 
 1. `Read every Python file in the agents/ directory one by one` (watch micro-compact replace old results)

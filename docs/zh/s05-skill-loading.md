@@ -47,41 +47,56 @@ skills/
 
 2. SkillLoader 递归扫描 `SKILL.md` 文件, 用目录名作为技能标识。
 
-```python
-class SkillLoader:
-    def __init__(self, skills_dir: Path):
-        self.skills = {}
-        for f in sorted(skills_dir.rglob("SKILL.md")):
-            text = f.read_text()
-            meta, body = self._parse_frontmatter(text)
-            name = meta.get("name", f.parent.name)
-            self.skills[name] = {"meta": meta, "body": body}
+```rust
+struct SkillLoader {
+    // name -> (description, body)
+    skills: HashMap<String, (String, String)>,
+}
 
-    def get_descriptions(self) -> str:
-        lines = []
-        for name, skill in self.skills.items():
-            desc = skill["meta"].get("description", "")
-            lines.append(f"  - {name}: {desc}")
-        return "\n".join(lines)
+impl SkillLoader {
+    fn new(skills_dir: &Path) -> Self {
+        let mut skills = HashMap::new();
+        // 递归扫描 SKILL.md 文件
+        for entry in WalkDir::new(skills_dir).into_iter().flatten() {
+            if entry.file_name() == "SKILL.md" {
+                let text = fs::read_to_string(entry.path()).unwrap();
+                let (meta, body) = parse_frontmatter(&text);
+                let name = meta.get("name").cloned()
+                    .unwrap_or_else(|| entry.path().parent().unwrap()
+                        .file_name().unwrap().to_string_lossy().to_string());
+                skills.insert(name, (meta["description"].clone(), body));
+            }
+        }
+        SkillLoader { skills }
+    }
 
-    def get_content(self, name: str) -> str:
-        skill = self.skills.get(name)
-        if not skill:
-            return f"Error: Unknown skill '{name}'."
-        return f"<skill name=\"{name}\">\n{skill['body']}\n</skill>"
+    fn descriptions(&self) -> String {
+        self.skills.iter()
+            .map(|(name, (desc, _))| format!("  - {}: {}", name, desc))
+            .collect::<Vec<_>>().join("\n")
+    }
+
+    fn content(&self, name: &str) -> String {
+        match self.skills.get(name) {
+            Some((_, body)) => format!("<skill name=\"{}\">\n{}\n</skill>", name, body),
+            None => format!("Error: Unknown skill '{}'.", name),
+        }
+    }
+}
 ```
 
 3. 第一层写入系统提示。第二层不过是 dispatch map 中的又一个工具。
 
-```python
-SYSTEM = f"""You are a coding agent at {WORKDIR}.
-Skills available:
-{SKILL_LOADER.get_descriptions()}"""
+```rust
+let system = format!(
+    "You are a coding agent.\nSkills available:\n{}",
+    skill_loader.descriptions()
+);
 
-TOOL_HANDLERS = {
-    # ...base tools...
-    "load_skill": lambda **kw: SKILL_LOADER.get_content(kw["name"]),
-}
+// load_skill 加入 tool dispatch map
+tools.insert("load_skill".to_string(), Box::new(LoadSkillTool {
+    loader: Arc::new(skill_loader),
+}));
 ```
 
 模型知道有哪些技能 (便宜), 需要时再加载完整内容 (贵)。
@@ -99,7 +114,7 @@ TOOL_HANDLERS = {
 
 ```sh
 cd learn-claude-code
-python agents/s05_skill_loading.py
+cargo run --bin s05_skill_loading
 ```
 
 试试这些 prompt (英文 prompt 对 LLM 效果更好, 也可以用中文):

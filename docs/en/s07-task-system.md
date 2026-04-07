@@ -50,7 +50,7 @@ This task graph becomes the coordination backbone for everything after s07: back
 
 1. **TaskManager**: one JSON file per task, CRUD with dependency graph.
 
-```python
+```rust
 class TaskManager:
     def __init__(self, tasks_dir: Path):
         self.dir = tasks_dir
@@ -68,7 +68,7 @@ class TaskManager:
 
 2. **Dependency resolution**: completing a task clears its ID from every other task's `blockedBy` list, automatically unblocking dependents.
 
-```python
+```rust
 def _clear_dependency(self, completed_id):
     for f in self.dir.glob("task_*.json"):
         task = json.loads(f.read_text())
@@ -79,7 +79,7 @@ def _clear_dependency(self, completed_id):
 
 3. **Status + dependency wiring**: `update` handles transitions and dependency edges.
 
-```python
+```rust
 def update(self, task_id, status=None,
            add_blocked_by=None, add_blocks=None):
     task = self._load(task_id)
@@ -92,7 +92,7 @@ def update(self, task_id, status=None,
 
 4. Four task tools go into the dispatch map.
 
-```python
+```rust
 TOOL_HANDLERS = {
     # ...base tools...
     "task_create": lambda **kw: TASKS.create(kw["subject"]),
@@ -118,7 +118,7 @@ From s07 onward, the task graph is the default for multi-step work. s03's Todo r
 
 ```sh
 cd learn-claude-code
-python agents/s07_task_system.py
+cargo run --bin s07_task_system
 ```
 
 1. `Create 3 tasks: "Setup project", "Write code", "Write tests". Make them depend on each other in order.`

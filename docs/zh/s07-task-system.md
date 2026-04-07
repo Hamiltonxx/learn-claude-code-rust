@@ -50,56 +50,65 @@ s03 的 TodoManager 只是内存中的扁平清单: 没有顺序、没有依赖�
 
 1. **TaskManager**: 每个任务一个 JSON 文件, CRUD + 依赖图。
 
-```python
-class TaskManager:
-    def __init__(self, tasks_dir: Path):
-        self.dir = tasks_dir
-        self.dir.mkdir(exist_ok=True)
-        self._next_id = self._max_id() + 1
+```rust
+#[derive(Serialize, Deserialize)]
+struct TaskItem {
+    id: u32,
+    title: String,
+    deps: Vec<u32>,   // blockedBy
+    done: bool,
+}
 
-    def create(self, subject, description=""):
-        task = {"id": self._next_id, "subject": subject,
-                "status": "pending", "blockedBy": [],
-                "blocks": [], "owner": ""}
-        self._save(task)
-        self._next_id += 1
-        return json.dumps(task, indent=2)
+struct TaskManager { tasks: Vec<TaskItem>, next_id: u32 }
+
+impl TaskManager {
+    fn add(&mut self, title: &str, deps: Vec<u32>) -> u32 {
+        self.next_id += 1;
+        self.tasks.push(TaskItem {
+            id: self.next_id, title: title.to_string(),
+            deps, done: false,
+        });
+        // 持久化到 JSON 文件
+        fs::write("tasks.json", serde_json::to_string_pretty(&self.tasks).unwrap()).unwrap();
+        self.next_id
+    }
+}
 ```
 
 2. **依赖解除**: 完成任务时, 自动将其 ID 从其他任务的 `blockedBy` 中移除, 解锁后续任务。
 
-```python
-def _clear_dependency(self, completed_id):
-    for f in self.dir.glob("task_*.json"):
-        task = json.loads(f.read_text())
-        if completed_id in task.get("blockedBy", []):
-            task["blockedBy"].remove(completed_id)
-            self._save(task)
+```rust
+// 拓扑排序：返回所有依赖已完成的就绪任务
+fn ready(&self) -> Vec<&TaskItem> {
+    let done_ids: HashSet<u32> = self.tasks.iter()
+        .filter(|t| t.done).map(|t| t.id).collect();
+    self.tasks.iter()
+        .filter(|t| !t.done && t.deps.iter().all(|d| done_ids.contains(d)))
+        .collect()
+}
 ```
 
 3. **状态变更 + 依赖关联**: `update` 处理状态转换和依赖边。
 
-```python
-def update(self, task_id, status=None,
-           add_blocked_by=None, add_blocks=None):
-    task = self._load(task_id)
-    if status:
-        task["status"] = status
-        if status == "completed":
-            self._clear_dependency(task_id)
-    self._save(task)
+```rust
+fn complete(&mut self, id: u32) {
+    if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
+        t.done = true;
+        // 完成后自动持久化
+        fs::write("tasks.json",
+            serde_json::to_string_pretty(&self.tasks).unwrap()).unwrap();
+    }
+}
 ```
 
 4. 四个任务工具加入 dispatch map。
 
-```python
-TOOL_HANDLERS = {
-    # ...base tools...
-    "task_create": lambda **kw: TASKS.create(kw["subject"]),
-    "task_update": lambda **kw: TASKS.update(kw["task_id"], kw.get("status")),
-    "task_list":   lambda **kw: TASKS.list_all(),
-    "task_get":    lambda **kw: TASKS.get(kw["task_id"]),
-}
+```rust
+// 四个任务工具注册进 dispatch map
+tools.insert("task_create".into(), Box::new(TaskCreateTool { mgr: mgr.clone() }));
+tools.insert("task_update".into(), Box::new(TaskUpdateTool { mgr: mgr.clone() }));
+tools.insert("task_list".into(),   Box::new(TaskListTool   { mgr: mgr.clone() }));
+tools.insert("task_get".into(),    Box::new(TaskGetTool    { mgr: mgr.clone() }));
 ```
 
 从 s07 起, 任务图是多步工作的默认选择。s03 的 Todo 仍可用于单次会话内的快速清单。
@@ -118,7 +127,7 @@ TOOL_HANDLERS = {
 
 ```sh
 cd learn-claude-code
-python agents/s07_task_system.py
+cargo run --bin s07_task_system
 ```
 
 试试这些 prompt (英文 prompt 对 LLM 效果更好, 也可以用中文):

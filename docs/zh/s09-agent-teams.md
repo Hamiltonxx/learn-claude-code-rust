@@ -39,67 +39,85 @@ Communication:
 
 1. TeammateManager 通过 config.json 维护团队名册。
 
-```python
-class TeammateManager:
-    def __init__(self, team_dir: Path):
-        self.dir = team_dir
-        self.dir.mkdir(exist_ok=True)
-        self.config_path = self.dir / "config.json"
-        self.config = self._load_config()
-        self.threads = {}
+```rust
+struct Teammate {
+    name: String,
+    role: String,
+    system_prompt: String,
+    // 收件箱：mpsc channel
+    inbox_tx: mpsc::Sender<String>,
+}
+
+// 共享队伍注册表
+type TeamRoster = Arc<Mutex<Vec<Teammate>>>;
 ```
 
 2. `spawn()` 创建队友并在线程中启动 agent loop。
 
-```python
-def spawn(self, name: str, role: str, prompt: str) -> str:
-    member = {"name": name, "role": role, "status": "working"}
-    self.config["members"].append(member)
-    self._save_config()
-    thread = threading.Thread(
-        target=self._teammate_loop,
-        args=(name, role, prompt), daemon=True)
-    thread.start()
-    return f"Spawned teammate '{name}' (role: {role})"
+```rust
+// spawn：为每个 teammate 创建独立的 tokio task + channel
+fn spawn_teammate(name: String, role: String, system: String,
+                  client: Arc<Client>, api_key: Arc<String>) -> mpsc::Sender<String> {
+    let (inbox_tx, mut inbox_rx) = mpsc::channel::<String>(32);
+
+    tokio::spawn(async move {
+        let mut messages = vec![Message { role: "user".into(),
+            content: json!(format!("你是 {}，角色：{}", name, role)) }];
+        loop {
+            // 检查收件箱
+            while let Ok(msg) = inbox_rx.try_recv() {
+                messages.push(Message { role: "user".into(),
+                    content: json!(format!("<inbox>{}</inbox>", msg)) });
+            }
+            let resp = call_api(&client, &api_key, &messages, &[], &system).await;
+            if resp.stop_reason.as_deref() != Some("tool_use") { break; }
+            // 工具执行...
+        }
+    });
+
+    inbox_tx
+}
 ```
 
 3. MessageBus: append-only 的 JSONL 收件箱。`send()` 追加一行; `read_inbox()` 读取全部并清空。
 
-```python
-class MessageBus:
-    def send(self, sender, to, content, msg_type="message", extra=None):
-        msg = {"type": msg_type, "from": sender,
-               "content": content, "timestamp": time.time()}
-        if extra:
-            msg.update(extra)
-        with open(self.dir / f"{to}.jsonl", "a") as f:
-            f.write(json.dumps(msg) + "\n")
-
-    def read_inbox(self, name):
-        path = self.dir / f"{name}.jsonl"
-        if not path.exists(): return "[]"
-        msgs = [json.loads(l) for l in path.read_text().strip().splitlines() if l]
-        path.write_text("")  # drain
-        return json.dumps(msgs, indent=2)
+```rust
+// 发消息给 teammate：直接发到对方的 inbox_tx channel
+async fn send_message(roster: &TeamRoster, to: &str, content: &str) -> String {
+    let tx = {
+        let r = roster.lock().unwrap();
+        r.iter().find(|t| t.name == to).map(|t| t.inbox_tx.clone())
+    };
+    match tx {
+        Some(tx) => {
+            let _ = tx.send(content.to_string()).await;
+            format!("消息已发送给 {}", to)
+        }
+        None => format!("找不到队友 {}", to),
+    }
+}
 ```
 
 4. 每个队友在每次 LLM 调用前检查收件箱, 将消息注入上下文。
 
-```python
-def _teammate_loop(self, name, role, prompt):
-    messages = [{"role": "user", "content": prompt}]
-    for _ in range(50):
-        inbox = BUS.read_inbox(name)
-        if inbox != "[]":
-            messages.append({"role": "user",
-                "content": f"<inbox>{inbox}</inbox>"})
-            messages.append({"role": "assistant",
-                "content": "Noted inbox messages."})
-        response = client.messages.create(...)
-        if response.stop_reason != "tool_use":
-            break
-        # execute tools, append results...
-    self._find_member(name)["status"] = "idle"
+```rust
+// teammate 主循环：每轮检查收件箱，调用 API，执行工具
+tokio::spawn(async move {
+    let mut messages = vec![Message { role: "user".into(),
+        content: json!(system_prompt) }];
+    loop {
+        // 非阻塞排空收件箱
+        while let Ok(msg) = inbox_rx.try_recv() {
+            messages.push(Message { role: "user".into(),
+                content: json!(format!("<inbox>{}</inbox>", msg)) });
+            messages.push(Message { role: "assistant".into(),
+                content: json!("已记录消息。") });
+        }
+        let resp = call_api(&client, &api_key, &messages, &tool_defs, &system).await;
+        if resp.stop_reason.as_deref() != Some("tool_use") { break; }
+        // 执行工具，追加结果...
+    }
+});
 ```
 
 ## 相对 s08 的变更
@@ -117,7 +135,7 @@ def _teammate_loop(self, name, role, prompt):
 
 ```sh
 cd learn-claude-code
-python agents/s09_agent_teams.py
+cargo run --bin s09_agent_teams
 ```
 
 试试这些 prompt (英文 prompt 对 LLM 效果更好, 也可以用中文):

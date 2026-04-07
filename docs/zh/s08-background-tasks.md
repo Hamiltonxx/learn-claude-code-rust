@@ -34,56 +34,61 @@ Agent --[spawn A]--[spawn B]--[other work]----
 
 1. BackgroundManager 用线程安全的通知队列追踪任务。
 
-```python
-class BackgroundManager:
-    def __init__(self):
-        self.tasks = {}
-        self._notification_queue = []
-        self._lock = threading.Lock()
+```rust
+// tokio::spawn 后台执行，mpsc channel 通知主循环
+let (done_tx, mut done_rx) = mpsc::channel::<String>(16);
 ```
 
 2. `run()` 启动守护线程, 立即返回。
 
-```python
-def run(self, command: str) -> str:
-    task_id = str(uuid.uuid4())[:8]
-    self.tasks[task_id] = {"status": "running", "command": command}
-    thread = threading.Thread(
-        target=self._execute, args=(task_id, command), daemon=True)
-    thread.start()
-    return f"Background task {task_id} started"
+```rust
+// 后台任务工具：spawn 一个 tokio task，立即返回
+async fn execute(&self, input: Value) -> String {
+    let command = input["command"].as_str().unwrap_or("").to_string();
+    let task_id = format!("{:x}", rand::random::<u32>());
+    let tx = self.done_tx.clone();
+    let id = task_id.clone();
+
+    tokio::spawn(async move {
+        let out = Command::new("sh").arg("-c").arg(&command)
+            .output().await.unwrap();
+        let result = String::from_utf8_lossy(&out.stdout).to_string();
+        let _ = tx.send(format!("[bg:{}] {}", id, &result[..result.len().min(200)])).await;
+    });
+
+    format!("后台任务 {} 已启动", task_id)
+}
 ```
 
 3. 子进程完成后, 结果进入通知队列。
 
-```python
-def _execute(self, task_id, command):
-    try:
-        r = subprocess.run(command, shell=True, cwd=WORKDIR,
-            capture_output=True, text=True, timeout=300)
-        output = (r.stdout + r.stderr).strip()[:50000]
-    except subprocess.TimeoutExpired:
-        output = "Error: Timeout (300s)"
-    with self._lock:
-        self._notification_queue.append({
-            "task_id": task_id, "result": output[:500]})
+```rust
+// 主循环每轮用 try_recv 非阻塞检查后台完成通知
+while let Ok(msg) = done_rx.try_recv() {
+    println!("[后台通知] {}", msg);
+    messages.push(Message { role: "user".into(),
+        content: json!(format!("<background-results>{}</background-results>", msg)) });
+    messages.push(Message { role: "assistant".into(),
+        content: json!("已记录后台结果。") });
+}
 ```
 
 4. 每次 LLM 调用前排空通知队列。
 
-```python
-def agent_loop(messages: list):
-    while True:
-        notifs = BG.drain_notifications()
-        if notifs:
-            notif_text = "\n".join(
-                f"[bg:{n['task_id']}] {n['result']}" for n in notifs)
-            messages.append({"role": "user",
-                "content": f"<background-results>\n{notif_text}\n"
-                           f"</background-results>"})
-            messages.append({"role": "assistant",
-                "content": "Noted background results."})
-        response = client.messages.create(...)
+```rust
+// agent loop：每轮先排空通知，再调用 API
+loop {
+    // 排空后台完成通知（非阻塞）
+    while let Ok(msg) = done_rx.try_recv() {
+        messages.push(Message { role: "user".into(),
+            content: json!(format!("<background-results>{}</background-results>", msg)) });
+        messages.push(Message { role: "assistant".into(),
+            content: json!("已记录后台结果。") });
+    }
+
+    let resp = call_api(&client, &api_key, &messages, &tool_defs, system).await;
+    // ... 工具执行 ...
+}
 ```
 
 循环保持单线程。只有子进程 I/O 被并行化。
@@ -101,7 +106,7 @@ def agent_loop(messages: list):
 
 ```sh
 cd learn-claude-code
-python agents/s08_background_tasks.py
+cargo run --bin s08_background_tasks
 ```
 
 试试这些 prompt (英文 prompt 对 LLM 效果更好, 也可以用中文):

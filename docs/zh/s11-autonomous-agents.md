@@ -49,72 +49,75 @@ Identity re-injection after compression:
 
 1. 队友循环分两个阶段: WORK 和 IDLE。LLM 停止调用工具 (或调用了 `idle`) 时, 进入 IDLE。
 
-```python
-def _loop(self, name, role, prompt):
-    while True:
-        # -- WORK PHASE --
-        messages = [{"role": "user", "content": prompt}]
-        for _ in range(50):
-            response = client.messages.create(...)
-            if response.stop_reason != "tool_use":
-                break
-            # execute tools...
-            if idle_requested:
-                break
-
-        # -- IDLE PHASE --
-        self._set_status(name, "idle")
-        resume = self._idle_poll(name, messages)
-        if not resume:
-            self._set_status(name, "shutdown")
-            return
-        self._set_status(name, "working")
+```rust
+// teammate 自主循环：loop + select!，轮询任务板和 shutdown 信号
+async fn teammate_worker(
+    name: String, role: String,
+    board: TaskBoard,
+    client: Arc<Client>, api_key: Arc<String>,
+    mut shutdown: mpsc::Receiver<()>,
+) {
+    loop {
+        tokio::select! {
+            _ = sleep(Duration::from_secs(2)) => {
+                // 尝试从任务板认领一个匹配 role 的任务
+                if let Some(task) = board_claim(&board, &role) {
+                    println!("[{}] 认领 #{}: {}", name, task.id, task.title);
+                    let result = run_task(&client, &api_key, &task.title).await;
+                    board_complete(&board, task.id, &result);
+                }
+            }
+            _ = shutdown.recv() => {
+                println!("[{}] 收到关闭信号，退出。", name);
+                break;
+            }
+        }
+    }
+}
 ```
 
 2. 空闲阶段循环轮询收件箱和任务看板。
 
-```python
-def _idle_poll(self, name, messages):
-    for _ in range(IDLE_TIMEOUT // POLL_INTERVAL):  # 60s / 5s = 12
-        time.sleep(POLL_INTERVAL)
-        inbox = BUS.read_inbox(name)
-        if inbox:
-            messages.append({"role": "user",
-                "content": f"<inbox>{inbox}</inbox>"})
-            return True
-        unclaimed = scan_unclaimed_tasks()
-        if unclaimed:
-            claim_task(unclaimed[0]["id"], name)
-            messages.append({"role": "user",
-                "content": f"<auto-claimed>Task #{unclaimed[0]['id']}: "
-                           f"{unclaimed[0]['subject']}</auto-claimed>"})
-            return True
-    return False  # timeout -> shutdown
+```rust
+// board_claim：找到第一个 Open 且 role_hint 匹配的任务，原子地标为 InProgress
+fn board_claim(board: &TaskBoard, role: &str) -> Option<BoardTask> {
+    let mut tasks = board.lock().unwrap();
+    for task in tasks.iter_mut() {
+        if task.status == BoardStatus::Open
+            && (task.role_hint == role || task.role_hint == "any")
+        {
+            task.status = BoardStatus::InProgress { claimed_by: role.to_string() };
+            return Some(task.clone());
+        }
+    }
+    None
+}
 ```
 
 3. 任务看板扫描: 找 pending 状态、无 owner、未被阻塞的任务。
 
-```python
-def scan_unclaimed_tasks() -> list:
-    unclaimed = []
-    for f in sorted(TASKS_DIR.glob("task_*.json")):
-        task = json.loads(f.read_text())
-        if (task.get("status") == "pending"
-                and not task.get("owner")
-                and not task.get("blockedBy")):
-            unclaimed.append(task)
-    return unclaimed
+```rust
+// 共享任务板用 Arc<Mutex<Vec<BoardTask>>> 保护并发访问
+type TaskBoard = Arc<Mutex<Vec<BoardTask>>>;
+
+// 添加任务
+fn board_add(board: &TaskBoard, title: &str, role_hint: &str) -> u32 {
+    let mut tasks = board.lock().unwrap();
+    let id = tasks.iter().map(|t| t.id).max().unwrap_or(0) + 1;
+    tasks.push(BoardTask { id, title: title.to_string(),
+        role_hint: role_hint.to_string(), status: BoardStatus::Open });
+    id
+}
 ```
 
 4. 身份重注入: 上下文过短 (说明发生了压缩) 时, 在开头插入身份块。
 
-```python
-if len(messages) <= 3:
-    messages.insert(0, {"role": "user",
-        "content": f"<identity>You are '{name}', role: {role}, "
-                   f"team: {team_name}. Continue your work.</identity>"})
-    messages.insert(1, {"role": "assistant",
-        "content": f"I am {name}. Continuing."})
+```rust
+// shutdown 协议：主 agent 通过 mpsc channel 发信号
+let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
+
+// 退出时发送
+let _ = shutdown_tx.send(()).await;
 ```
 
 ## 相对 s10 的变更
@@ -132,7 +135,7 @@ if len(messages) <= 3:
 
 ```sh
 cd learn-claude-code
-python agents/s11_autonomous_agents.py
+cargo run --bin s11_autonomous
 ```
 
 试试这些 prompt (英文 prompt 对 LLM 效果更好, 也可以用中文):

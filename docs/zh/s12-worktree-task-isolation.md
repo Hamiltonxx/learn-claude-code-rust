@@ -38,14 +38,14 @@ State machines:
 
 1. **创建任务。** 先把目标持久化。
 
-```python
+```rust
 TASKS.create("Implement auth refactor")
 # -> .tasks/task_1.json  status=pending  worktree=""
 ```
 
 2. **创建 worktree 并绑定任务。** 传入 `task_id` 自动将任务推进到 `in_progress`。
 
-```python
+```rust
 WORKTREES.create("auth-refactor", task_id=1)
 # -> git worktree add -b wt/auth-refactor .worktrees/auth-refactor HEAD
 # -> index.json gets new entry, task_1.json gets worktree="auth-refactor"
@@ -53,7 +53,7 @@ WORKTREES.create("auth-refactor", task_id=1)
 
 绑定同时写入两侧状态:
 
-```python
+```rust
 def bind_worktree(self, task_id, worktree):
     task = self._load(task_id)
     task["worktree"] = worktree
@@ -64,7 +64,7 @@ def bind_worktree(self, task_id, worktree):
 
 3. **在 worktree 中执行命令。** `cwd` 指向隔离目录。
 
-```python
+```rust
 subprocess.run(command, shell=True, cwd=worktree_path,
                capture_output=True, text=True, timeout=300)
 ```
@@ -73,7 +73,7 @@ subprocess.run(command, shell=True, cwd=worktree_path,
    - `worktree_keep(name)` -- 保留目录供后续使用。
    - `worktree_remove(name, complete_task=True)` -- 删除目录, 完成绑定任务, 发出事件。一个调用搞定拆除 + 完成。
 
-```python
+```rust
 def remove(self, name, force=False, complete_task=False):
     self._run_git(["worktree", "remove", wt["path"]])
     if complete_task and wt.get("task_id") is not None:
@@ -111,7 +111,7 @@ def remove(self, name, force=False, complete_task=False):
 
 ```sh
 cd learn-claude-code
-python agents/s12_worktree_task_isolation.py
+cargo run --bin s12_worktree
 ```
 
 试试这些 prompt (英文 prompt 对 LLM 效果更好, 也可以用中文):

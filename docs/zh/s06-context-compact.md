@@ -46,59 +46,68 @@ continue    [Layer 2: auto_compact]
 
 1. **第一层 -- micro_compact**: 每次 LLM 调用前, 将旧的 tool result 替换为占位符。
 
-```python
-def micro_compact(messages: list) -> list:
-    tool_results = []
-    for i, msg in enumerate(messages):
-        if msg["role"] == "user" and isinstance(msg.get("content"), list):
-            for j, part in enumerate(msg["content"]):
-                if isinstance(part, dict) and part.get("type") == "tool_result":
-                    tool_results.append((i, j, part))
-    if len(tool_results) <= KEEP_RECENT:
-        return messages
-    for _, _, part in tool_results[:-KEEP_RECENT]:
-        if len(part.get("content", "")) > 100:
-            part["content"] = f"[Previous: used {tool_name}]"
-    return messages
+```rust
+// 超过阈值时，把前半段压缩成摘要，保留后半段原文
+async fn maybe_compact(
+    client: &Client,
+    api_key: &str,
+    messages: &mut Vec<Message>,
+) {
+    if messages.len() < COMPACT_THRESHOLD { return; }
+    let half = messages.len() / 2;
+    let old: Vec<Message> = messages.drain(..half).collect();
+    // 用 LLM 生成摘要
+    let summary = summarize(client, api_key, &old).await;
+    // 把摘要插回消息列表头部
+    messages.insert(0, Message { role: "user".into(),
+        content: json!(format!("[对话摘要] {}", summary)) });
+    messages.insert(1, Message { role: "assistant".into(),
+        content: json!("已了解历史摘要，继续处理。") });
+    println!("[压缩] 已将 {} 条消息压缩为摘要", half);
+}
 ```
 
 2. **第二层 -- auto_compact**: token 超过阈值时, 保存完整对话到磁盘, 让 LLM 做摘要。
 
-```python
-def auto_compact(messages: list) -> list:
-    # Save transcript for recovery
-    transcript_path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
-    with open(transcript_path, "w") as f:
-        for msg in messages:
-            f.write(json.dumps(msg, default=str) + "\n")
-    # LLM summarizes
-    response = client.messages.create(
-        model=MODEL,
-        messages=[{"role": "user", "content":
-            "Summarize this conversation for continuity..."
-            + json.dumps(messages, default=str)[:80000]}],
-        max_tokens=2000,
-    )
-    return [
-        {"role": "user", "content": f"[Compressed]\n\n{response.content[0].text}"},
-        {"role": "assistant", "content": "Understood. Continuing."},
-    ]
+```rust
+async fn summarize(
+    client: &Client,
+    api_key: &str,
+    messages: &[Message],
+) -> String {
+    let text = messages.iter()
+        .filter_map(|m| m.content.as_str()
+            .map(|s| format!("[{}] {}", m.role, s)))
+        .collect::<Vec<_>>().join("\n");
+
+    let req = vec![Message { role: "user".into(),
+        content: json!(format!("请把以下对话压缩成简洁摘要：\n{}", text)) }];
+    let resp = call_api(client, api_key, &req, &[], "你是摘要助手").await;
+    resp.content.iter()
+        .filter_map(|b| if let ContentBlock::Text { text } = b
+            { Some(text.clone()) } else { None })
+        .collect::<Vec<_>>().join("")
+}
 ```
 
 3. **第三层 -- manual compact**: `compact` 工具按需触发同样的摘要机制。
 
 4. 循环整合三层:
 
-```python
-def agent_loop(messages: list):
-    while True:
-        micro_compact(messages)                        # Layer 1
-        if estimate_tokens(messages) > THRESHOLD:
-            messages[:] = auto_compact(messages)       # Layer 2
-        response = client.messages.create(...)
-        # ... tool execution ...
-        if manual_compact:
-            messages[:] = auto_compact(messages)       # Layer 3
+```rust
+loop {
+    // S06：消息过多时自动压缩
+    maybe_compact(&client, &api_key, &mut messages).await;
+
+    let resp = call_api(&client, &api_key, &messages, &tool_defs, system).await;
+
+    if resp.stop_reason.as_deref() == Some("tool_use") {
+        // 执行工具...
+    } else {
+        // 输出最终回答
+        break;
+    }
+}
 ```
 
 完整历史通过 transcript 保存在磁盘上。信息没有真正丢失, 只是移出了活跃上下文。
@@ -117,7 +126,7 @@ def agent_loop(messages: list):
 
 ```sh
 cd learn-claude-code
-python agents/s06_context_compact.py
+cargo run --bin s06_context_compact
 ```
 
 试试这些 prompt (英文 prompt 对 LLM 效果更好, 也可以用中文):

@@ -34,7 +34,7 @@ Agent --[spawn A]--[spawn B]--[other work]----
 
 1. BackgroundManager tracks tasks with a thread-safe notification queue.
 
-```python
+```rust
 class BackgroundManager:
     def __init__(self):
         self.tasks = {}
@@ -44,7 +44,7 @@ class BackgroundManager:
 
 2. `run()` starts a daemon thread and returns immediately.
 
-```python
+```rust
 def run(self, command: str) -> str:
     task_id = str(uuid.uuid4())[:8]
     self.tasks[task_id] = {"status": "running", "command": command}
@@ -56,7 +56,7 @@ def run(self, command: str) -> str:
 
 3. When the subprocess finishes, its result goes into the notification queue.
 
-```python
+```rust
 def _execute(self, task_id, command):
     try:
         r = subprocess.run(command, shell=True, cwd=WORKDIR,
@@ -71,7 +71,7 @@ def _execute(self, task_id, command):
 
 4. The agent loop drains notifications before each LLM call.
 
-```python
+```rust
 def agent_loop(messages: list):
     while True:
         notifs = BG.drain_notifications()
@@ -101,7 +101,7 @@ The loop stays single-threaded. Only subprocess I/O is parallelized.
 
 ```sh
 cd learn-claude-code
-python agents/s08_background_tasks.py
+cargo run --bin s08_background_tasks
 ```
 
 1. `Run "sleep 5 && echo done" in the background, then create a file while it runs`
